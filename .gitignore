@@ -1,0 +1,19 @@
+# 构建产物
+.gradle/
+build/
+app/build/
+
+# 本地环境与签名（不入库）
+local.properties
+*.jks
+*.keystore
+
+# IDE
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 运行期产物
+dist/
+cache/

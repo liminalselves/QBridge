@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material3 品牌色（深色） -->
+    <color name="brand_primary">#BCC2FF</color>
+    <color name="brand_on_primary">#1B2682</color>
+    <color name="brand_primary_container">#3340B0</color>
+    <color name="brand_on_primary_container">#DFE2FF</color>
+    <color name="brand_secondary">#C2C6DC</color>
+    <color name="brand_on_secondary">#2B3042</color>
+    <color name="brand_secondary_container">#424A5F</color>
+    <color name="brand_on_secondary_container">#DEE1F9</color>
+
+    <!-- 界面底色（深色） -->
+    <color name="app_background">#111218</color>
+    <color name="app_surface">#1B1C23</color>
+    <color name="app_on_surface">#E4E2EC</color>
+    <color name="app_surface_variant">#2A2B35</color>
+    <color name="app_on_surface_variant">#C4C6D4</color>
+    <color name="app_outline">#4E5162</color>
+
+    <bool name="light_status_bar">false</bool>
+</resources>

@@ -1,0 +1,24 @@
+{
+  "platform": {
+    "adapter": "napcat"
+  },
+  "napcat": {
+    "ws_url": "ws://127.0.0.1:3001",
+    "access_token": ""
+  },
+  "onebot": {
+    "transport": "forward_ws",
+    "ws_url": "ws://127.0.0.1:6700",
+    "access_token": ""
+  },
+  "misskey": {
+    "host": "",
+    "character_id": "",
+    "dialogue_style_id": ""
+  },
+  "command_prefix": "/",
+  "allowed_qq": [],
+  "allowed_groups": [],
+  "admin_qq": [],
+  "log_file": ""
+}

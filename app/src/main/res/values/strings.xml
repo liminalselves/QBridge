@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">QBridge</string>
+    <!-- 与官方 Termux（com.termux）独立共存 -->
+    <string name="btn_start">启动桥接</string>
+    <string name="btn_stop">停止桥接</string>
+    <string name="btn_save_config">保存配置</string>
+    <string name="btn_reload_config">重新加载</string>
+    <string name="notification_channel">桥接服务</string>
+    <string name="notification_title">QBridge</string>
+    <string name="notification_text">桥接服务运行中</string>
+</resources>

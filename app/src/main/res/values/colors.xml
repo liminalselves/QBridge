@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material3 品牌色（浅色） -->
+    <color name="brand_primary">#4C5BD4</color>
+    <color name="brand_on_primary">#FFFFFF</color>
+    <color name="brand_primary_container">#DFE2FF</color>
+    <color name="brand_on_primary_container">#000F5C</color>
+    <color name="brand_secondary">#595E71</color>
+    <color name="brand_on_secondary">#FFFFFF</color>
+    <color name="brand_secondary_container">#DEE1F9</color>
+    <color name="brand_on_secondary_container">#161B2C</color>
+
+    <!-- 界面底色（浅色） -->
+    <color name="app_background">#F2F3F8</color>
+    <color name="app_surface">#FFFFFF</color>
+    <color name="app_on_surface">#1A1C22</color>
+    <color name="app_surface_variant">#E3E4EE</color>
+    <color name="app_on_surface_variant">#464A54</color>
+    <color name="app_outline">#C5C8D4</color>
+
+    <!-- 状态圆点 -->
+    <color name="dot_green">#2ECC71</color>
+    <color name="dot_amber">#FFB030</color>
+    <color name="dot_red">#FF5A5F</color>
+    <color name="dot_gray">#9AA0AC</color>
+
+    <!-- 终端风格日志区 -->
+    <color name="log_bg">#14151B</color>
+    <color name="log_fg">#C7D0E4</color>
+
+    <!-- 自适应图标背景 -->
+    <color name="ic_launcher_bg">#F2F3F7</color>
+
+    <bool name="light_status_bar">true</bool>
+</resources>
