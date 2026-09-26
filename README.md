@@ -143,6 +143,11 @@ app/src/main/java/com/aliya2qq/bridge/
 - **后台被杀**：应用首次启动会申请电池优化白名单，请在系统弹窗中允许。
 - **首次登录**：受协议限制，QQ 登录必须人工扫码，这是正常流程而非故障。
 
+## 许可
+
+本项目以 [AGPL-3.0](LICENSE) 发布。随应用分发的部分第三方二进制（bash、proot 等）
+为 GPL-3.0，来源与相应义务见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## 第三方组件
 
 本项目随包分发了来自 Termux 工具链与 proot 的二进制，运行期还会下载 NapCat 等第三方组件，
