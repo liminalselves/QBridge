@@ -11,10 +11,10 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
-// 离线预置包：大体积文件存放于工作区 dat/（不入库），其下 preload/ 子目录里的文件
-// 会在构建时并入 assets/preload。目录不存在（如开源 clone）则跳过，
+// 离线预置包：大体积文件放在项目内 dat/（本地存在、不入库），其下 preload/ 子目录里的
+// 文件会在构建时并入 assets/preload。目录不存在（如公开 clone）则跳过，
 // 应用初始化时按在线路径自动下载。dat 根目录请只保留 preload/。
-val preloadAssetsDir = rootProject.file(localProps.getProperty("preload.assetsDir", "../dat"))
+val preloadAssetsDir = rootProject.file(localProps.getProperty("preload.assetsDir", "dat"))
 
 android {
     namespace = "com.aliya2qq.bridge"

@@ -33,10 +33,10 @@ set "TASK=assembleRelease"
 if /i "%1"=="debug" set "TASK=assembleDebug"
 if /i "%1"=="release" set "TASK=assembleRelease"
 
-if exist "..\dat\preload" (
-    echo [预置包] 检测到 ..\dat\preload，产物将内置离线资源
+if exist "dat\preload" (
+    echo [预置包] 检测到 dat\preload，产物将内置离线资源
 ) else (
-    echo [预置包] 未找到 ..\dat\preload，产物不含离线资源，初始化时联网下载
+    echo [预置包] 未找到 dat\preload，产物不含离线资源，初始化时联网下载
 )
 
 echo [构建] 开始 %TASK% ...
