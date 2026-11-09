@@ -5,7 +5,7 @@
 
 产出：`app-release.apk`（约 **628MB**，含预置 NTQQ、rootfs 与运行库）。
 
-当前版本：**1.6.4-typing-fast** / versionCode 14（在 `app/build.gradle.kts` 查看/修改）。
+版本号以 `app/build.gradle.kts` 的 `versionCode` / `versionName` 为准，历史见 §9。
 
 ---
 
@@ -80,8 +80,8 @@ Android 只打包 `lib*.so`，可执行文件需改名。必须包含：
 
 ### 3.1 签名
 
-`keystore/napcat-bridge-release.jks`
-alias `napcatbridge`，口令见 `app/build.gradle.kts`。
+发布签名四项写在 `local.properties`（见 README「构建」）。未配置时调试包照常构建，
+`assembleRelease` 产出未签名 APK。
 
 ### 3.2 一键编译
 
@@ -148,14 +148,14 @@ adb shell am start -n com.aliya2qq.bridge/.ui.MainActivity
 6. **qq-libs**：解运行库进 rootfs（一次性，之后由标记文件跳过）。
 7. **sw_template**：拷到 `src/assets/`，供 WebUI 生成 `sw.js`。
 
-全程离线，约 2~5 分钟。主界面状态变为 **「环境：就绪」** 后点 **「启动NapCat」**。
+全程离线，约 2~5 分钟。首页「运行环境」变为 **已就绪** 后，在「QQ（NapCat）」行点 **启动**。
 
 ### 4.1 QQ 登录（-q 快速登录）
 
-- 在 **设置 → QQ 号（快速登录，可空）** 填入 QQ 号一次即可，
+- 在 **设置 → 机器人 QQ 号（可空）** 填入 QQ 号一次即可，
   启动时读取（`qq_uin.txt` 持久化），之后每次启动自动带 `-q <uin>` 快速登录，**无需扫码**。
 - 未填 QQ 号或存储的登录态已失效时，NapCat 进入扫码等待（`waiting_qrcode`）：
-  用日志 ASCII 二维码 / 主界面二维码图片 / `txz.qq.com` 解码 URL 扫码一次即可。
+  首页「QQ 登录」卡片会显示 ASCII 或图片二维码（按屏宽自动缩放），也可用 WebUI 或 `txz.qq.com` 解码 URL 扫码。
 - 存储会话被系统杀进程等异常破坏时，快速登录会失败并回退扫码；
   应用的会话修复动作（`qq_session_action.txt=rename`）会在下次启动把损坏的
   `/root/.config/QQ` 改名为 `QQ.bak` 保留现场（Worker 段错误的应急开关）。
@@ -168,7 +168,7 @@ adb shell am start -n com.aliya2qq.bridge/.ui.MainActivity
 |----|------|
 | proot | `PROOT_NO_SECCOMP=1`、`PROOT_TMP_DIR`、`PROOT_LOADER`、`unset LD_PRELOAD` |
 | 显示 | Xvfb 在 proot 下 `link()` 锁文件易失败；使用 `--ozone-platform=headless --disable-dev-shm-usage` |
-| WebUI | `http://127.0.0.1:6099/webui`；token 显示在主界面「WebUI Token」栏（每 10s 刷新识别） |
+| WebUI | `http://127.0.0.1:6099/webui`；token 从 NapCat 日志识别，首页「QQ 登录」卡片可复制或直接打开 |
 | OneBot | WS 服务端 `127.0.0.1:3001`（在 NapCat WebUI 网络配置里建，配置随 rootfs 持久化） |
 | 进程检测 | `isNapCatRunning` 直接扫 `/proc`（同 uid 可读），`$PREFIX/bin/pgrep` 被 SELinux 禁止，勿用 |
 | 进程清理 | `stop` 用 Kotlin `Process.killProcess` 扫描同 uid + `/system/bin/pkill`（toybox），模式串用 `[q]` 字符类防自匹配 |
@@ -180,11 +180,18 @@ proot 下 NapCat 的 pong 可能延迟超过 20s，OkHttp 会因 pong 超时把�
 形成「连接 → 20s EOF → 3s 重连」循环，表现为**消息发出后经常无响应**
 （重连空窗期事件永久丢失）。服务端每 10s 推 heartbeat，断连由 onFailure 触发重连即可。
 
+### 5.1.1 WebSocket 必须处理 onClosing（勿回退）
+
+对端发来关闭帧时，OkHttp 先回调 `onClosing`，不会自动触发 `onClosed`。
+`OneBotAdapter` 与 `MisskeyStream` 的监听器都要在 `onClosing` 里回应 `close()` 并放行等待，
+否则 NapCat 重启/Misskey 断开后连接卡死、永远不重连。
+`MisskeyStream` 的退避只在连接存活满 30 秒后才重置，避免服务端反复踢人时以最短间隔重连。
+
 ### 5.2 「正在输入」功能
 
-等待 Misskey 回复期间，每 **0.5s** 调一次 NapCat 扩展 API `set_input_status`
-（参数 `{"user_id": "<对方QQ>", "event_type": 1}`，仅私聊），
-直到回复到达或超时。QQ 输入状态衰减极快，刷新间隔不可加大到秒级以上。
+`agents/messages/send` 请求期间、等待流式补发回复期间、生成图片期间，每 **0.5s** 调一次
+NapCat 扩展 API `set_input_status`（参数 `{"user_id": "<对方QQ>", "event_type": 1}`，仅私聊）。
+QQ 输入状态衰减极快，刷新间隔不可加大到秒级以上。
 
 ### 5.3 会话修复动作（qq_session_action.txt）
 
@@ -286,6 +293,8 @@ qbridge_unified/
 
 | 版本 | 要点 |
 |------|------|
+| 1.7.0-agent-sync (16) | 对齐当前 Misskey agents 接口：主动消息取全文、角色表情包、画图序号、审核/中止判定、已读回执、封禁通知；新增 /retry /undo /stop /checkin /memory；控制台 UI 重做 |
+| 1.6.5-opensource (15) | 开源基线 |
 | 1.6.4-typing-fast (14) | 正在输入 0.5s 高频刷新（参考 AstrBot input_state 插件） |
 | 1.6.3-battery (13) | 首启申请电池优化白名单 |
 | 1.6.2-typing (12) | 等待 Misskey 回复时 QQ 显示正在输入（set_input_status） |
@@ -298,7 +307,7 @@ qbridge_unified/
 2. `stop` 用 Kotlin kill + `/system/bin/pkill`（`$PREFIX/bin/pkill` 被拒 → 进程杀不掉，二次启动覆写运行中进程的 mmap 库 → SIGSEGV）。
 3. pgrep/pkill 模式串用 `[q]` 字符类，防调用 shell 自匹配（否则 start 误判已在运行、直接早退）。
 4. qq-libs.tar 一次性解压（标记文件 + 资产大小），tar 无 `usr/` 条目，勿把 `usr/lib/...` 加回检查清单。
-5. 日志双写修复（BridgeLog.listener 与 LogPump.onLine 不能同时 append）。
+5. 日志双写修复：日志面板只从 `BridgeLog.buffer` 渲染，LogPump.onLine 不得再写入面板。
 6. 启动脚本 `bash -n` 语法校验通过；`${'$'}` 转义与 SESSION_ACTION 传递勿动。
 
 ---

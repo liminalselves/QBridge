@@ -9,6 +9,7 @@
         <item name="colorOnSecondary">@color/brand_on_secondary</item>
         <item name="colorSecondaryContainer">@color/brand_secondary_container</item>
         <item name="colorOnSecondaryContainer">@color/brand_on_secondary_container</item>
+        <item name="colorError">@color/dot_red</item>
 
         <item name="android:colorBackground">@color/app_background</item>
         <item name="colorSurface">@color/app_surface</item>
@@ -17,8 +18,48 @@
         <item name="colorOnSurfaceVariant">@color/app_on_surface_variant</item>
         <item name="colorOutline">@color/app_outline</item>
 
-        <item name="android:statusBarColor">@color/app_surface</item>
+        <item name="android:statusBarColor">@color/app_background</item>
         <item name="android:navigationBarColor">@color/app_surface</item>
         <item name="android:windowLightStatusBar">@bool/light_status_bar</item>
+    </style>
+
+    <!-- 圆角描边卡片 -->
+    <style name="Widget.QBridge.Card" parent="Widget.Material3.CardView.Outlined">
+        <item name="cardBackgroundColor">?attr/colorSurface</item>
+        <item name="cardCornerRadius">18dp</item>
+        <item name="strokeColor">@color/app_outline_soft</item>
+        <item name="strokeWidth">1dp</item>
+    </style>
+
+    <style name="TextAppearance.QBridge.CardTitle" parent="TextAppearance.Material3.TitleMedium">
+        <item name="android:textColor">?attr/colorOnSurface</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="TextAppearance.QBridge.Caption" parent="TextAppearance.Material3.BodySmall">
+        <item name="android:textColor">?attr/colorOnSurfaceVariant</item>
+    </style>
+
+    <style name="Widget.QBridge.TextField" parent="Widget.Material3.TextInputLayout.OutlinedBox">
+        <item name="boxCornerRadiusTopStart">12dp</item>
+        <item name="boxCornerRadiusTopEnd">12dp</item>
+        <item name="boxCornerRadiusBottomStart">12dp</item>
+        <item name="boxCornerRadiusBottomEnd">12dp</item>
+    </style>
+
+    <style name="Widget.QBridge.TextField.Dropdown" parent="Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+        <item name="boxCornerRadiusTopStart">12dp</item>
+        <item name="boxCornerRadiusTopEnd">12dp</item>
+        <item name="boxCornerRadiusBottomStart">12dp</item>
+        <item name="boxCornerRadiusBottomEnd">12dp</item>
+    </style>
+
+    <!-- 状态行右侧的操作按钮 -->
+    <style name="Widget.QBridge.RowButton" parent="Widget.Material3.Button">
+        <item name="android:minWidth">84dp</item>
+        <item name="android:minHeight">40dp</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+        <item name="android:textSize">13sp</item>
     </style>
 </resources>

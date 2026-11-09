@@ -3,7 +3,6 @@ package com.aliya2qq.bridge.core
 import com.aliya2qq.bridge.commands.ChatContext
 import com.aliya2qq.bridge.commands.PermissionException
 import com.aliya2qq.bridge.commands.dispatch
-import com.aliya2qq.bridge.commands.isAliyaSession
 import com.aliya2qq.bridge.commands.parse
 import com.aliya2qq.bridge.config.BridgeConfig
 import com.aliya2qq.bridge.db.Database
@@ -11,6 +10,7 @@ import com.aliya2qq.bridge.db.bool
 import com.aliya2qq.bridge.db.str
 import com.aliya2qq.bridge.db.strOrNull
 import com.aliya2qq.bridge.misskey.AgentSendResult
+import com.aliya2qq.bridge.misskey.AuthError
 import com.aliya2qq.bridge.misskey.BannedError
 import com.aliya2qq.bridge.misskey.MisskeyAPIError
 import com.aliya2qq.bridge.misskey.MisskeyClient
@@ -19,6 +19,7 @@ import com.aliya2qq.bridge.misskey.RateLimitError
 import com.aliya2qq.bridge.platforms.OneBotSegments
 import com.aliya2qq.bridge.platforms.PlatformHub
 import com.aliya2qq.bridge.platforms.PlatformMessage
+import com.aliya2qq.bridge.render.ContentBlock
 import com.aliya2qq.bridge.render.ReplyRender
 import com.aliya2qq.bridge.util.AsyncEvent
 import com.aliya2qq.bridge.util.BridgeLog
@@ -28,10 +29,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.UUID
@@ -47,25 +50,28 @@ private val NOTIFY_LABELS = mapOf(
     "renote" to "转发了你的帖子",
 )
 
-private val AI_USERNAMES = setOf("aliya", "agent", "ai")
-
-private const val TEXT_DEDUP_SIZE = 20
 private const val ID_DEDUP_SIZE = 500
 private const val MEMBER_INFO_CACHE_SIZE = 512
 
-/** 回复正文后紧跟发图前的间隔，给客户端一点渲染时间。 */
-private const val REPLY_IMAGE_DELAY_MS = 300L
+/** 会话信息（角色、文风、封禁状态、表情包）的复查间隔。 */
+private const val SESSION_CHECK_TTL_MS = 10 * 60_000L
+
+/** QQ 的“正在输入”衰减很快，需要高频刷新（与 AstrBot input_state 一致）。 */
+private const val TYPING_INTERVAL_MS = 500L
 
 fun privChan(qq: String) = "p:$qq"
 fun groupChan(gid: String) = "g:$gid"
 
-/** 同一通道的消息聚合：短时间内的连发合并成一轮发送，等待 AI 回复后再发下一轮。 */
+/** 同一通道的消息聚合：短时间内的连发合并成一轮发送，等 AI 回复后再发下一轮。 */
 class ChatPipe {
     val lock = Mutex()
     val texts = ArrayList<String>()
     val images = ArrayList<String>()
     var timer: Job? = null
-    var awaiting = false
+
+    /** 本轮 send 未直接带回回复，正在等流式推送。 */
+    @Volatile
+    var awaitingStream = false
     val replyEvent = AsyncEvent()
 }
 
@@ -77,6 +83,25 @@ data class PendingBind(
     val expiresAt: Double = 0.0,
     var task: Job? = null,
 )
+
+/** 会话的缓存快照，来自 agents/sessions/show。 */
+data class SessionInfo(
+    val id: String,
+    val name: String,
+    val characterId: String,
+    val characterName: String,
+    val styleId: String?,
+    val modelId: String?,
+    val imageModelId: String?,
+    val segmented: Boolean,
+    val banned: Boolean,
+    val characterBanned: Boolean,
+    /** 角色表情包 key → 图片地址。 */
+    val stickers: Map<String, String>,
+    val checkedAt: Long,
+)
+
+private data class Inflight(val token: String, val sessionId: String, val requestId: String)
 
 /**
  * 双向桥接核心：QQ 私聊/群聊与 Misskey（Aliya 会话）之间的消息转发、
@@ -97,8 +122,8 @@ class Bridge(
         }
     )
 
-    // mapsLock 保护 streams/pipes 的创建销毁与 memberInfo 的读写。
-    // 其余共享状态使用并发容器，槽内对象（ArrayDeque 等）用 synchronized 保护。
+    // mapsLock 保护 streams/sendLocks/pipes 的创建销毁与 memberInfo 的读写。
+    // 其余共享状态使用并发容器，槽内对象（LinkedHashMap 等）用 synchronized 保护。
     private val mapsLock = Mutex()
 
     private val streams = HashMap<String, MisskeyStream>()
@@ -110,12 +135,11 @@ class Bridge(
         }
     }
 
-    private val recentTexts = ConcurrentHashMap<String, ArrayDeque<String>>()
     private val deliveredIds = ConcurrentHashMap<String, LinkedHashMap<String, Unit>>()
-    private val sessionCache = ConcurrentHashMap<String, List<JSONObject>>()
+    private val sessionListCache = ConcurrentHashMap<String, List<JSONObject>>()
+    private val sessions = ConcurrentHashMap<String, SessionInfo>()
+    private val inflight = ConcurrentHashMap<String, Inflight>()
     private val miauthTasks = ConcurrentHashMap<String, Job>()
-    private val segEnabledMap = ConcurrentHashMap<String, Boolean>()
-    private val sessionChan = ConcurrentHashMap<String, String>()
     private val pendingBinds = ConcurrentHashMap<String, PendingBind>()
     private val groupSink = ConcurrentHashMap<String, MutableList<String>>()
     private val groupUserIds = ConcurrentHashMap<String, MutableMap<String, Int>>()
@@ -153,6 +177,7 @@ class Bridge(
                 binding.str("misskey_token"),
                 chan,
                 onEvent = { c, etype, payload -> onMisskeyEvent(c, etype, payload) },
+                onAuthFailed = { c -> onStreamAuthFailed(c) },
             )
             streams[chan] = stream
             stream.start(scope)
@@ -163,6 +188,11 @@ class Bridge(
         mapsLock.withLock {
             streams.remove(chan)?.stop()
         }
+    }
+
+    private suspend fun onStreamAuthFailed(chan: String) {
+        sendText(chan, "⚠️ Misskey Token 已失效，消息推送已停止。请发送 /bind 重新绑定。")
+        stopStream(chan)
     }
 
     // ---------- QQ 事件入口 ----------
@@ -186,10 +216,7 @@ class Bridge(
         val text = finalizeText(message.text, message.atTargets, groupId = null)
         val images = message.images
         if (text.isEmpty() && images.isEmpty()) return
-        val ctx = ChatContext(
-            chan = privChan(qq), isGroup = false, qq = qq,
-            groupId = null, nickname = "", role = "",
-        )
+        val ctx = ChatContext(chan = privChan(qq), isGroup = false, qq = qq)
         BridgeLog.i("QQ $qq ->: ${text.take(100)}" + (if (images.isNotEmpty()) " [+${images.size}图]" else ""))
         if (text.startsWith(cfg.commandPrefix)) {
             handleCommand(ctx, text)
@@ -205,19 +232,17 @@ class Bridge(
         val allowedGroups = cfg.allowedGroups
         if (allowedGroups.isNotEmpty() && gid !in allowedGroups) return
         val nickname = (message.card.ifBlank { message.nickname }).trim()
-        val role = message.role
         val text = finalizeText(message.text, message.atTargets, groupId = gid)
         val images = message.images
         if (text.isEmpty() && images.isEmpty()) return
         val groupBinding = db.getGroupBinding(gid)
         val binderQq = groupBinding?.str("binder_qq") ?: ""
         val globalAdmins = cfg.adminQq
-        val isManager = qq == binderQq || qq in db.getGroupAdmins(gid) || qq in globalAdmins
         val ctx = ChatContext(
             chan = groupChan(gid), isGroup = true, qq = qq, groupId = gid,
-            nickname = nickname, role = role,
+            nickname = nickname, role = message.role,
             binderQq = binderQq,
-            isManager = isManager,
+            isManager = qq == binderQq || qq in db.getGroupAdmins(gid) || qq in globalAdmins,
             canManageAdmins = qq == binderQq || qq in globalAdmins,
         )
         BridgeLog.i(
@@ -229,12 +254,13 @@ class Bridge(
             message.mentionedSelf -> forwardToMisskey(ctx, text, images)
             groupBinding != null && groupBinding.bool("awareness_enabled", false) -> {
                 // 未@机器人的群消息收进“感知池”，下一轮对话时一并带给 AI
-                val sink = groupSink.getOrPut(ctx.chan) { Collections.synchronizedList(ArrayList()) }
                 val body = text.ifEmpty { if (images.isNotEmpty()) "[图片]" else "" }
                 if (body.isNotEmpty()) {
+                    val sink = groupSink.getOrPut(ctx.chan) { Collections.synchronizedList(ArrayList()) }
                     val formatted = formatMessageForAgent(ctx, body)
                     sink.add(formatted)
-                    BridgeLog.i("群 $gid 感知收集：${formatted.take(80)}")
+                    // 感知池只留最近的消息，避免长时间没人@时无限增长
+                    synchronized(sink) { while (sink.size > GROUP_SINK_LIMIT) sink.removeAt(0) }
                 }
             }
         }
@@ -243,13 +269,11 @@ class Bridge(
     private suspend fun handleCommand(ctx: ChatContext, text: String) {
         val (cmd, args) = parse(text, cfg.commandPrefix)
         if (cmd.isEmpty()) {
-            sendText(ctx.chan, "空指令。发送 /help 查看全部指令。")
+            sendText(ctx.chan, "空指令。发送 ${cfg.commandPrefix}help 查看全部指令。")
             return
         }
         val reply = dispatch(this, ctx, cmd, args)
-        if (!reply.isNullOrEmpty()) {
-            sendText(ctx.chan, reply)
-        }
+        if (!reply.isNullOrEmpty()) sendText(ctx.chan, reply)
     }
 
     // ---------- QQ 消息段解析 ----------
@@ -262,8 +286,7 @@ class Bridge(
 
     private suspend fun resolveAt(groupId: String, targetQq: String): String {
         if (targetQq.isEmpty() || targetQq == "all") return "@全体成员"
-        val personal = db.getBinding(targetQq)
-        val uname = personal?.strOrNull("misskey_username")
+        val uname = db.getBinding(targetQq)?.strOrNull("misskey_username")
         if (!uname.isNullOrBlank()) return "@$uname"
         val key = "$groupId|$targetQq"
         // memberInfo 是按访问顺序淘汰的 LRU，读也会改变结构，必须在锁内完成
@@ -273,11 +296,7 @@ class Bridge(
             }
             memberInfo[key]
         }
-        return if (info != null) memberDisplayName(info) else "@某人"
-    }
-
-    private fun memberDisplayName(info: JSONObject): String {
-        val name = info.optString("card").ifBlank { info.optString("nickname") }.trim()
+        val name = info?.let { it.optString("card").ifBlank { it.optString("nickname") }.trim() } ?: ""
         return if (name.isNotEmpty()) "@$name" else "@某人"
     }
 
@@ -285,42 +304,25 @@ class Bridge(
 
     private suspend fun speakerLabel(ctx: ChatContext): String {
         val nums = groupUserIds.getOrPut(ctx.chan) { HashMap() }
-        val n: Int = synchronized(nums) {
-            nums.getOrPut(ctx.qq) { nums.size + 1 }
-        }
-        val personal = db.getBinding(ctx.qq)
-        val uname = personal?.strOrNull("misskey_username")
+        val n: Int = synchronized(nums) { nums.getOrPut(ctx.qq) { nums.size + 1 } }
+        val uname = db.getBinding(ctx.qq)?.strOrNull("misskey_username")
         val name = if (!uname.isNullOrBlank()) "@$uname" else ctx.nickname.ifBlank { "群成员" }
         return "用户$n $name"
     }
 
     /** 群聊消息发给 AI 前置上发言人标识；私聊原样透传。 */
-    suspend fun formatMessageForAgent(ctx: ChatContext, text: String): String {
+    private suspend fun formatMessageForAgent(ctx: ChatContext, text: String): String {
         if (!ctx.isGroup) return text
         val label = speakerLabel(ctx)
         return if (text.isNotEmpty()) "【$label】$text" else "【$label】"
     }
 
     suspend fun sendText(chan: String, text: String, imageUrl: String? = null) {
-        val limit = cfg.qqMessageSplit
-        val chunks = if (text.isEmpty() && imageUrl != null) listOf("")
-        else text.chunked(limit.coerceAtLeast(1)).ifEmpty { listOf("") }
+        val chunks = if (text.isEmpty()) listOf("") else splitForQq(text, cfg.qqMessageSplit)
         chunks.forEachIndexed { i, chunk ->
             val segments = ArrayList<JSONObject>()
-            if (chunk.isNotEmpty() || imageUrl == null) {
-                segments.add(
-                    JSONObject()
-                        .put("type", "text")
-                        .put("data", JSONObject().put("text", chunk))
-                )
-            }
-            if (imageUrl != null && i == chunks.size - 1) {
-                segments.add(
-                    JSONObject()
-                        .put("type", "image")
-                        .put("data", JSONObject().put("file", imageUrl))
-                )
-            }
+            if (chunk.isNotEmpty()) segments.add(textSeg(chunk))
+            if (imageUrl != null && i == chunks.size - 1) segments.add(imageSeg(imageUrl))
             if (segments.isEmpty()) return@forEachIndexed
             try {
                 platform.sendTo(chan, segments)
@@ -330,70 +332,98 @@ class Bridge(
         }
     }
 
-    // ---------- 绑定查询辅助 ----------
+    private fun textSeg(text: String) = JSONObject().put("type", "text").put("data", JSONObject().put("text", text))
+    private fun imageSeg(url: String) = JSONObject().put("type", "image").put("data", JSONObject().put("file", url))
+
+    /** 私聊里周期性刷新 QQ“正在输入”；群聊没有对应接口，返回 null。 */
+    private fun startTyping(chan: String): Job? {
+        if (!chan.startsWith("p:")) return null
+        val qq = chan.substring(2)
+        return scope.launch {
+            while (isActive) {
+                try {
+                    platform.callApi("set_input_status", JSONObject().put("user_id", qq).put("event_type", 1))
+                } catch (e: Exception) {
+                    BridgeLog.d("设置输入状态失败，停止刷新: ${e.message}")
+                    return@launch
+                }
+                delay(TYPING_INTERVAL_MS)
+            }
+        }
+    }
+
+    // ---------- 绑定 ----------
 
     fun getBindingByChan(chan: String): Map<String, Any?>? =
         if (chan.startsWith("g:")) db.getGroupBinding(chan.substring(2))
         else db.getBinding(chan.substring(2))
+
+    fun requireBinding(ctx: ChatContext): Map<String, Any?> =
+        getBindingByChan(ctx.chan) ?: throw PermissionException(
+            if (ctx.isGroup) "本群尚未绑定 Misskey 账号，请绑定者或群管理员发送 /bind"
+            else "尚未绑定 Misskey 账号，请先发送 /bind"
+        )
 
     fun setChanCurrentSession(chan: String, sessionId: String?) {
         if (chan.startsWith("g:")) db.setGroupCurrentSession(chan.substring(2), sessionId)
         else db.setCurrentSession(chan.substring(2), sessionId)
     }
 
-    fun setChanLastSeen(chan: String, messageId: String) {
-        if (chan.startsWith("g:")) db.setGroupLastSeenMessage(chan.substring(2), messageId)
-        else db.setLastSeenMessage(chan.substring(2), messageId)
-    }
-
     suspend fun bindChanToken(ctx: ChatContext, token: String): String {
-        val user = misskey.validateToken(token)
-            ?: return "❌ Token 无效或已过期，请在 Misskey「设置 → 其他 → API」重新生成。"
+        val user = try {
+            misskey.validateToken(token)
+        } catch (e: MisskeyAPIError) {
+            return "❌ ${e.friendly()}"
+        } catch (e: Exception) {
+            return "❌ 无法连接 Misskey：${e.message ?: e}"
+        } ?: return "❌ Token 无效或已过期，请在 Misskey「设置 → 其他 → API」重新生成。"
         return finishBind(ctx, token, user)
     }
 
     private suspend fun finishBind(ctx: ChatContext, token: String, user: JSONObject): String {
         val userId = user.optString("id", "")
         val username = user.optString("username", "")
-        val name = user.optString("name").ifBlank { user.optString("username", "") }
+        val name = user.optString("name").takeIf { !user.isNull("name") && it.isNotBlank() } ?: username
         var note = ""
         if (ctx.isGroup) {
-            val oldBinder = db.getGroupBinding(ctx.groupId ?: "")?.str("binder_qq") ?: ""
-            db.upsertGroupBinding(ctx.groupId ?: "", token, userId, username, name, ctx.qq)
+            val gid = ctx.groupId ?: ""
+            val oldBinder = db.getGroupBinding(gid)?.str("binder_qq") ?: ""
+            db.upsertGroupBinding(gid, token, userId, username, name, ctx.qq)
             groupUserIds.remove(ctx.chan)
             groupSink.remove(ctx.chan)
-            note = "\n本群现已共用该账号与会话（绑定者：QQ ${ctx.qq}）。"
+            note = "本群现已共用该账号与会话（绑定者：QQ ${ctx.qq}）。\n"
             if (oldBinder.isNotEmpty() && oldBinder != ctx.qq) {
-                note += "\n绑定者已由 QQ $oldBinder 更换为 QQ ${ctx.qq}。"
+                note += "绑定者已由 QQ $oldBinder 更换为 QQ ${ctx.qq}。\n"
             }
         } else {
             val exists = db.getBindingByUserId(userId)
             db.upsertBinding(ctx.qq, token, userId, username, name)
             if (exists != null && exists.str("qq_number") != ctx.qq) {
-                note = "\n该账号此前已绑定在 QQ ${exists.str("qq_number")}，现已改为绑定当前 QQ。"
+                note = "该账号此前已绑定在 QQ ${exists.str("qq_number")}，两个 QQ 将共用同一账号。\n"
             }
         }
         startStream(ctx.chan, getBindingByChan(ctx.chan) ?: emptyMap())
+        var sessionLine = ""
         try {
-            val binding = getBindingByChan(ctx.chan)
-            if (binding != null) {
-                val sessionId = ensureSession(ctx.chan, binding)
-                sessionChan.putIfAbsent(sessionId, ctx.chan)
-                val msgs = misskey.agentsTimeline(token, sessionId, limit = 1)
-                msgs.firstOrNull()?.let { setChanLastSeen(ctx.chan, it.optString("id")) }
-            }
+            val info = sessions[ensureSession(ctx.chan)]
+            if (info != null) sessionLine = "会话：${info.name.ifBlank { "未命名" }}（角色 ${info.characterName}）\n"
+        } catch (e: MisskeyAPIError) {
+            sessionLine = "⚠️ 会话准备失败：${e.friendly()}\n"
         } catch (e: Exception) {
-            BridgeLog.w("初始化绑定游标失败: $e")
+            BridgeLog.w("绑定后准备会话失败: $e")
         }
-        val scopeText = if (ctx.isGroup) "本群" else "你"
         return "✅ 绑定成功！\n" +
-            "Misskey: ${user.optString("name").ifBlank { user.optString("username") }} (@${user.optString("username")})\n" +
-            note + scopeText + "现在直接发送消息即可与 AI 角色对话，发送 /help 查看全部指令。"
+            "Misskey：$name (@$username)\n" +
+            sessionLine + note +
+            "${ctx.scope}现在直接发送消息即可与 AI 对话" +
+            (if (ctx.isGroup) "（群聊需 @机器人）" else "") +
+            "，发送 /help 查看全部指令。"
     }
 
     suspend fun unbindChan(ctx: ChatContext): String {
         miauthTasks.remove(ctx.chan)?.cancel()
         stopStream(ctx.chan)
+        sessionListCache.remove(ctx.chan)
         if (ctx.isGroup) {
             if (db.deleteGroupBinding(ctx.groupId ?: "")) {
                 groupSink.remove(ctx.chan)
@@ -406,28 +436,27 @@ class Bridge(
         else "你尚未绑定 Misskey 账号。"
     }
 
-    suspend fun startMiauthBind(ctx: ChatContext): String {
+    fun startMiauthBind(ctx: ChatContext): String {
         miauthTasks.remove(ctx.chan)?.cancel()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         db.addMiauthPending(sessionId, ctx.qq)
-        val base = cfg.misskeyBaseUrl()
         val name = URLEncoder.encode(cfg.misskey.miauthName, "UTF-8")
         val permission = URLEncoder.encode(cfg.misskey.miauthPermission, "UTF-8")
-        val url = "$base/miauth/$sessionId?name=$name&permission=$permission"
+        val url = "${cfg.misskeyBaseUrl()}/miauth/$sessionId?name=$name&permission=$permission"
         miauthTasks[ctx.chan] = scope.launch { pollMiauth(ctx, sessionId) }
-        val scopeText = if (ctx.isGroup) "本群" else ""
-        return "请在浏览器打开以下链接并授权（5 分钟内有效）：\n" +
+        val minutes = (cfg.miauthWaitTotal / 60).toInt().coerceAtLeast(1)
+        return "请在浏览器打开以下链接并授权（$minutes 分钟内有效）：\n" +
             "$url\n\n" +
-            "授权完成后会自动完成${scopeText}绑定。也可以直接发送 /bind <token> " +
-            "（token 在 Misskey「设置 → 其他 → API」生成）。"
+            "授权后会自动完成${if (ctx.isGroup) "本群" else ""}绑定。" +
+            "也可以发送 /bind <token>（在 Misskey「设置 → 其他 → API」生成）。"
     }
 
     private suspend fun pollMiauth(ctx: ChatContext, sessionId: String) {
-        val deadline = System.currentTimeMillis() / 1000.0 + cfg.miauthWaitTotal
-        val interval = cfg.miauthPollInterval
+        val deadline = System.currentTimeMillis() + (cfg.miauthWaitTotal * 1000).toLong()
+        val interval = (cfg.miauthPollInterval * 1000).toLong().coerceAtLeast(1000)
         try {
-            while (System.currentTimeMillis() / 1000.0 < deadline) {
-                delay((interval * 1000).toLong())
+            while (System.currentTimeMillis() < deadline) {
+                delay(interval)
                 if (db.getMiauthPending(sessionId) == null) return
                 val res = try {
                     misskey.miauthCheck(sessionId)
@@ -435,97 +464,177 @@ class Bridge(
                     BridgeLog.w("MiAuth check 失败: $e")
                     continue
                 } ?: continue
-                val token = res.optString("token")
                 // 授权刚完成的瞬间网络容易抖动，校验失败只记日志，下一轮继续
                 val user = try {
-                    misskey.validateToken(token)
+                    misskey.validateToken(res.optString("token"))
                 } catch (e: Exception) {
                     BridgeLog.w("MiAuth token 校验失败，稍后重试: $e")
                     continue
                 }
+                db.deleteMiauthPending(sessionId)
                 if (user == null) {
-                    sendText(ctx.chan, "❌ 授权成功但 Token 校验失败，请重试 /bind")
+                    sendText(ctx.chan, "❌ 授权成功但 Token 校验失败，请重新 /bind")
                     return
                 }
-                db.deleteMiauthPending(sessionId)
-                val reply = finishBind(ctx, token, user)
-                sendText(ctx.chan, reply)
+                sendText(ctx.chan, finishBind(ctx, res.optString("token"), user))
                 return
             }
             db.deleteMiauthPending(sessionId)
-            sendText(ctx.chan, "MiAuth 授权超时，请重新发送 /bind")
+            sendText(ctx.chan, "MiAuth 授权已超时，如需绑定请重新发送 /bind")
         } catch (e: CancellationException) {
             db.deleteMiauthPending(sessionId)
             throw e
+        } finally {
+            miauthTasks.remove(ctx.chan, kotlinx.coroutines.currentCoroutineContext()[Job])
         }
+    }
+
+    fun requestBindConfirm(ctx: ChatContext, kind: String, token: String = ""): String {
+        cancelPendingBind(ctx.chan)
+        val timeout = cfg.bindConfirmTimeout
+        val p = PendingBind(
+            chan = ctx.chan, qq = ctx.qq, kind = kind, token = token,
+            expiresAt = System.currentTimeMillis() / 1000.0 + timeout,
+        )
+        p.task = scope.launch {
+            delay((timeout * 1000).toLong().coerceAtLeast(100))
+            if (pendingBinds.remove(ctx.chan, p)) {
+                sendText(p.chan, "QQ ${p.qq} 的绑定请求超时未确认，已自动取消。")
+            }
+        }
+        pendingBinds[ctx.chan] = p
+        BridgeLog.i("群 ${ctx.groupId} 收到待确认绑定请求（QQ ${ctx.qq}，$kind）")
+        return "本群已有绑定。QQ ${ctx.qq} 发起的重新绑定需要管理员确认：\n" +
+            "管理员请在 ${timeout.toInt()} 秒内发送 /确认（超时自动取消）。"
+    }
+
+    fun popPendingBind(chan: String): PendingBind? {
+        val p = pendingBinds.remove(chan) ?: return null
+        p.task?.cancel()
+        if (p.expiresAt > 0 && System.currentTimeMillis() / 1000.0 > p.expiresAt) return null
+        return p
+    }
+
+    private fun cancelPendingBind(chan: String) {
+        pendingBinds.remove(chan)?.task?.cancel()
     }
 
     // ---------- 会话管理 ----------
 
-    private fun rememberSessionData(chan: String, sessionData: JSONObject) {
-        segEnabledMap[chan] = sessionData.opt("segmentedOutputEnabled") != false
-    }
-
-    fun isSegEnabled(chan: String): Boolean? = segEnabledMap[chan]
-    fun setSegEnabled(chan: String, value: Boolean) {
-        segEnabledMap[chan] = value
-    }
-
-    fun clearGroupSink(chan: String) {
-        groupSink.remove(chan)
-    }
-
-    suspend fun ensureSession(chan: String, binding: Map<String, Any?>?): String {
-        if (binding == null) {
-            throw PermissionException("未绑定")
+    /** 读取并缓存会话详情；会话缺文风时补上配置里的默认文风。 */
+    fun loadSession(token: String, sessionId: String): SessionInfo {
+        var data = misskey.sessionsShow(token, sessionId)
+        if (data.isNull("dialogueStyleId") || data.optString("dialogueStyleId").isBlank()) {
+            misskey.ensureStyleSubscribed(token, cfg.misskey.dialogueStyleId)
+            misskey.sessionsUpdate(token, sessionId, JSONObject().put("dialogueStyleId", cfg.misskey.dialogueStyleId))
+            data = misskey.sessionsShow(token, sessionId)
         }
-        val token = binding.str("misskey_token")
-        val sessionId = binding.strOrNull("current_session_id")
-        if (!sessionId.isNullOrBlank()) {
-            try {
-                val current = misskey.sessionsShow(token, sessionId)
-                if (isAliyaSession(cfg.misskey.characterId, current)) {
-                    ensureSessionStyle(token, sessionId, current)
-                    rememberSessionData(chan, current)
-                    return sessionId
-                }
-                BridgeLog.i("当前会话角色不匹配，重新选择 (通道 $chan)")
-            } catch (e: MisskeyAPIError) {
-                if (e.status !in listOf(400, 403, 404)) throw e
-                BridgeLog.i("当前会话不可用(${e.status})，重新选择 (通道 $chan)")
+        val stickers = HashMap<String, String>()
+        data.optJSONArray("characterStickers")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val s = arr.optJSONObject(i) ?: continue
+                val url = s.optJSONObject("file")?.optString("url")?.ifBlank { null } ?: continue
+                stickers[s.optString("key")] = url
             }
+        }
+        fun nullable(key: String) = if (data.isNull(key)) null else data.optString(key).ifBlank { null }
+        val info = SessionInfo(
+            id = sessionId,
+            name = data.optString("name"),
+            characterId = data.optString("characterId"),
+            characterName = data.optString("characterName").ifBlank { "Aliya" },
+            styleId = nullable("dialogueStyleId"),
+            modelId = nullable("agentModelId"),
+            imageModelId = nullable("agentImageModelId"),
+            segmented = data.optBoolean("segmentedOutputEnabled", true),
+            banned = data.optBoolean("sessionModerationBanned"),
+            characterBanned = data.optBoolean("characterModerationBanned"),
+            stickers = stickers,
+            checkedAt = System.currentTimeMillis(),
+        )
+        sessions[sessionId] = info
+        return info
+    }
+
+    fun sessionInfo(sessionId: String): SessionInfo? = sessions[sessionId]
+
+    /** 已读回执不影响主流程，放后台执行，失败只记日志。 */
+    private fun markReadAsync(token: String, sessionId: String) {
+        scope.launch { misskey.sessionsRead(token, sessionId) }
+    }
+
+    fun invalidateSession(sessionId: String?) {
+        if (sessionId != null) sessions.remove(sessionId)
+    }
+
+    /**
+     * 返回通道当前可用的会话 id：当前会话有效则沿用，否则复用最近一个本角色会话，
+     * 都没有就新建。会话被封禁时抛出 BannedError，交给用户决定是否 /new。
+     */
+    suspend fun ensureSession(chan: String): String {
+        val binding = getBindingByChan(chan) ?: throw PermissionException("未绑定")
+        val token = binding.str("misskey_token")
+        val characterId = cfg.misskey.characterId
+        val current = binding.strOrNull("current_session_id")?.ifBlank { null }
+        if (current != null) {
+            val cached = sessions[current]
+            val info = if (cached != null && System.currentTimeMillis() - cached.checkedAt < SESSION_CHECK_TTL_MS) {
+                cached
+            } else try {
+                loadSession(token, current)
+            } catch (e: MisskeyAPIError) {
+                if (e is AuthError || e is RateLimitError || e is BannedError || e.status >= 500) throw e
+                BridgeLog.i("当前会话不可用(${e.code})，重新选择 (通道 $chan)")
+                null
+            }
+            if (info != null && info.characterId == characterId) {
+                if (info.characterBanned) throw BannedError("AGENT_CHARACTER_MODERATION_BANNED")
+                if (info.banned) throw BannedError("AGENT_SESSION_MODERATION_BANNED")
+                return current
+            }
+            if (info != null) BridgeLog.i("当前会话不属于配置的角色，重新选择 (通道 $chan)")
+            invalidateSession(current)
             setChanCurrentSession(chan, null)
         }
-        val sessions = misskey.sessionsListMine(token)
-        for (s in sessions) {
-            if (isAliyaSession(cfg.misskey.characterId, s) && s.optString("id").isNotEmpty()) {
-                val sid = s.getString("id")
-                ensureSessionStyle(token, sid, s)
-                rememberSessionData(chan, s)
-                setChanCurrentSession(chan, sid)
-                BridgeLog.i("已复用已有 Aliya 会话 $sid (通道 $chan)")
-                return sid
-            }
+        val reuse = misskey.sessionsListMine(token).firstOrNull {
+            it.optString("characterId") == characterId && !it.optBoolean("sessionModerationBanned") &&
+                it.optString("id").isNotBlank()
         }
-        misskey.ensureStyleSubscribed(token, cfg.misskey.dialogueStyleId)
-        val sid = misskey.sessionsCreate(token, cfg.misskey.characterId, cfg.misskey.dialogueStyleId)
+        val sid = reuse?.optString("id") ?: createSession(token)
+        loadSession(token, sid)
         setChanCurrentSession(chan, sid)
-        BridgeLog.i("已为通道 $chan 创建会话 $sid")
+        BridgeLog.i("通道 $chan 使用会话 $sid" + if (reuse != null) "（复用）" else "（新建）")
         return sid
     }
 
-    private suspend fun ensureSessionStyle(token: String, sessionId: String, sessionData: JSONObject) {
-        if (sessionData.has("dialogueStyleId") && !sessionData.isNull("dialogueStyleId") &&
-            sessionData.optString("dialogueStyleId").isNotEmpty()
-        ) return
-        val styleId = cfg.misskey.dialogueStyleId
-        misskey.ensureStyleSubscribed(token, styleId)
-        misskey.sessionsUpdate(token, sessionId, JSONObject().put("dialogueStyleId", styleId))
+    private fun createSession(token: String): String {
+        misskey.ensureStyleSubscribed(token, cfg.misskey.dialogueStyleId)
+        return misskey.sessionsCreate(token, cfg.misskey.characterId, cfg.misskey.dialogueStyleId)
     }
 
-    suspend fun recreateSession(chan: String, binding: Map<String, Any?>): String {
-        setChanCurrentSession(chan, null)
-        return ensureSession(chan, binding)
+    /** /new：新建会话并切换，返回会话详情。 */
+    fun newSession(chan: String, token: String, name: String?): SessionInfo {
+        val sid = createSession(token)
+        if (!name.isNullOrBlank()) {
+            try {
+                misskey.sessionsUpdate(token, sid, JSONObject().put("name", name.take(256)))
+            } catch (e: Exception) {
+                BridgeLog.d("新会话命名失败: $e")
+            }
+        }
+        setChanCurrentSession(chan, sid)
+        return loadSession(token, sid)
+    }
+
+    fun cacheSessions(chan: String, list: List<JSONObject>) {
+        sessionListCache[chan] = list
+    }
+
+    fun cachedSession(chan: String, index: Int): JSONObject? =
+        sessionListCache[chan]?.getOrNull(index - 1)
+
+    fun clearGroupSink(chan: String) {
+        groupSink.remove(chan)
     }
 
     private suspend fun getSendLock(chan: String): Mutex = mapsLock.withLock {
@@ -540,9 +649,8 @@ class Bridge(
         pipe.lock.withLock {
             pipe.texts.add(formatted)
             pipe.images.addAll(images)
-            // timer 的启动与 pipeSendLoop finally 里的重启都在同一把锁下，
-            // 避免“旧循环收尾”与“新消息入队”互相覆盖 timer 造成双循环
-            if (pipe.timer == null && !pipe.awaiting) {
+            // timer 的启动与 pipeSendLoop finally 里的重启都在同一把锁下，避免双循环
+            if (pipe.timer == null) {
                 pipe.timer = scope.launch { pipeSendLoop(ctx, pipe) }
             }
         }
@@ -550,12 +658,8 @@ class Bridge(
 
     private suspend fun pipeSendLoop(ctx: ChatContext, pipe: ChatPipe) {
         try {
-            var debounceFirst = true
+            delay((cfg.floodMergeWindow * 1000).toLong())
             while (true) {
-                if (debounceFirst) {
-                    delay((cfg.floodMergeWindow * 1000).toLong())
-                    debounceFirst = false
-                }
                 val texts: List<String>
                 val images: List<String>
                 pipe.lock.withLock {
@@ -563,260 +667,297 @@ class Bridge(
                     images = pipe.images.toList()
                     pipe.texts.clear()
                     pipe.images.clear()
-                    if (texts.isNotEmpty()) pipe.awaiting = true
                 }
-                if (texts.isEmpty()) return
+                if (texts.isEmpty() && images.isEmpty()) return
                 val merged = texts.filter { it.isNotEmpty() }.joinToString("\n")
-                val replied = try {
+                pipe.replyEvent.clear()
+                val awaitStream = try {
                     sendRound(ctx, merged, images)
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     BridgeLog.e("发送轮次失败 (通道 ${ctx.chan})", e)
-                    true
+                    false
                 }
-                if (replied) continue
-                waitReplyWithTyping(ctx, pipe)
-                pipe.replyEvent.clear()
+                if (awaitStream) waitStreamReply(ctx, pipe)
             }
         } finally {
             pipe.lock.withLock {
                 pipe.timer = null
-                pipe.awaiting = false
-                if (pipe.texts.isNotEmpty()) {
+                if (pipe.texts.isNotEmpty() || pipe.images.isNotEmpty()) {
                     pipe.timer = scope.launch { pipeSendLoop(ctx, pipe) }
                 }
             }
         }
     }
 
-    /**
-     * 消息已发往 Misskey、等待回复期间，通过 NapCat 让 QQ 对端看到“正在输入”。
-     * QQ 的输入状态衰减很快，需要高频刷新（0.5s/次，与 AstrBot input_state 一致）。
-     */
-    private suspend fun waitReplyWithTyping(ctx: ChatContext, pipe: ChatPipe) {
-        val totalMs = (cfg.misskey.timeoutSend * 1000.0).toLong() + 60_000L
-        val step = 500L
-        var waited = 0L
-        while (waited < totalMs) {
-            if (!ctx.isGroup) {
-                try {
-                    platform.callApi(
-                        "set_input_status",
-                        JSONObject().put("user_id", ctx.qq).put("event_type", 1),
-                    )
-                } catch (e: Exception) {
-                    BridgeLog.w("设置输入状态失败（改为普通等待）: ${e.message}")
-                    if (!pipe.replyEvent.wait(totalMs - waited)) {
-                        BridgeLog.w("等待回复超时，继续处理队列 (通道 ${ctx.chan})")
-                    }
-                    return
-                }
+    /** send 没有直接带回回复（网关超时等）时，等流式推送补上，期间保持“正在输入”。 */
+    private suspend fun waitStreamReply(ctx: ChatContext, pipe: ChatPipe) {
+        pipe.awaitingStream = true
+        val typing = startTyping(ctx.chan)
+        try {
+            val totalMs = (cfg.misskey.timeoutSend * 1000.0).toLong() + 60_000L
+            if (!pipe.replyEvent.wait(totalMs)) {
+                BridgeLog.w("等待流式回复超时 (通道 ${ctx.chan})")
+                sendText(ctx.chan, "AI 迟迟没有回复，可能生成失败了。可以发送 /retry 重新生成。")
             }
-            if (pipe.replyEvent.wait(step)) return
-            waited += step
+        } finally {
+            typing?.cancel()
+            pipe.awaitingStream = false
         }
-        BridgeLog.w("等待回复超时，继续处理队列 (通道 ${ctx.chan})")
     }
 
-    private suspend fun sendRound(ctx: ChatContext, text: String, images: List<String>): Boolean {
+    /**
+     * 发送一轮对话。返回 true 表示回复还没到，需要等流式推送。
+     * @param fileId 已上传的图片（/retry 复用原图）；为 null 时按 images 上传 QQ 图片
+     * @param useSink 是否把群聊感知池的消息一并带上
+     */
+    private suspend fun sendRound(
+        ctx: ChatContext,
+        text: String,
+        images: List<String>,
+        fileId: String? = null,
+        useSink: Boolean = true,
+    ): Boolean {
         val binding = getBindingByChan(ctx.chan)
         if (binding == null) {
-            if (ctx.isGroup) {
-                sendText(
-                    ctx.chan,
-                    "本群还未绑定 Misskey 账号。\n" +
-                        "群管理员或任意成员可发送 /bind 完成绑定（绑定后全群共用），/help 查看帮助。"
-                )
-            } else {
-                sendText(
-                    ctx.chan,
-                    "你还未绑定 Misskey 账号。\n" +
-                        "发送 /bind 开始绑定（支持 MiAuth 授权），/help 查看帮助。"
-                )
-            }
-            return true
+            sendText(
+                ctx.chan,
+                if (ctx.isGroup) "本群还未绑定 Misskey 账号。\n群管理员或任意成员可发送 /bind 完成绑定（绑定后全群共用），/help 查看帮助。"
+                else "你还未绑定 Misskey 账号。\n发送 /bind 开始绑定（支持 MiAuth 授权），/help 查看帮助。"
+            )
+            return false
         }
         var msgText = text
-        if (ctx.isGroup) {
+        if (ctx.isGroup && useSink) {
             val sink = groupSink.remove(ctx.chan)
             if (!sink.isNullOrEmpty()) {
                 val collected = synchronized(sink) { sink.toList() }
-                msgText = if (msgText.isNotEmpty()) (collected + msgText).joinToString("\n")
-                else collected.joinToString("\n")
+                msgText = (collected + listOf(msgText)).filter { it.isNotEmpty() }.joinToString("\n")
             }
         }
-        val lock = getSendLock(ctx.chan)
-        lock.withLock {
+        getSendLock(ctx.chan).withLock {
             try {
-                val res = forwardLocked(ctx, binding, msgText, images)
-                val replyText = if (res == null || res.isNull("reply_text")) null else res.optString("reply_text")
-                return res != null && (!replyText.isNullOrEmpty() || !res.optBoolean("ok", true))
-            } catch (e: BannedError) {
-                sendText(ctx.chan, "发送失败：会话或角色被封禁（${e.code}）。可发送 /new 新建会话。")
-            } catch (e: RateLimitError) {
-                sendText(ctx.chan, "Misskey 限流中，请约 ${maxOf(1, e.retryAfter.toInt())} 秒后再试。")
+                return deliverRound(ctx, binding, msgText, images, fileId)
             } catch (e: TimeoutException) {
-                sendText(ctx.chan, "发送超时，请稍后重试。")
-            } catch (e: PermissionException) {
-                sendText(ctx.chan, "请先 /bind 绑定账号。")
+                // 服务端多半还在生成，完成后会经流式 newAgentMessage 推送
+                BridgeLog.w("发送等待超时，转为等待流式推送 (通道 ${ctx.chan})")
+                return true
             } catch (e: MisskeyAPIError) {
-                sendText(ctx.chan, "❌ Misskey 错误：$e")
+                sendText(ctx.chan, "❌ ${e.friendly()}")
+            } catch (e: PermissionException) {
+                sendText(ctx.chan, e.message ?: "请先 /bind 绑定账号。")
+            } catch (e: IOException) {
+                sendText(ctx.chan, "❌ 无法连接 Misskey：${e.message ?: e}")
             }
-            return true
+            return false
         }
     }
 
-    private suspend fun sendAgent(
-        token: String,
-        ctx: ChatContext,
-        binding: Map<String, Any?>,
-        sessionId0: String,
-        text: String,
-        fileId: String?,
-    ): Pair<String, JSONObject> {
-        fun pack(r: AgentSendResult) = JSONObject()
-            .put("ok", r.ok)
-            .put("delivered", r.delivered)
-            .put("reply_text", r.replyText ?: JSONObject.NULL)
-            .put("reply_message_id", r.replyMessageId ?: JSONObject.NULL)
-            .put("error", r.error ?: JSONObject.NULL)
-
-        var sessionId = sessionId0
-        return try {
-            sessionId to pack(misskey.agentsSend(token, sessionId, text, fileId))
-        } catch (e: BannedError) {
-            throw e
-        } catch (e: MisskeyAPIError) {
-            if (e.code.uppercase().contains("SESSION")) {
-                BridgeLog.w("会话失效，重建后重试 (通道 ${ctx.chan})")
-                sessionId = recreateSession(ctx.chan, binding)
-                sessionId to pack(misskey.agentsSend(token, sessionId, text, fileId))
-            } else throw e
-        }
-    }
-
-    private suspend fun forwardLocked(
+    private suspend fun deliverRound(
         ctx: ChatContext,
         binding: Map<String, Any?>,
         text: String,
         images: List<String>,
-    ): JSONObject? {
+        presetFileId: String?,
+    ): Boolean {
         val token = binding.str("misskey_token")
-        var fileId: String? = null
-        var msgText = text
-        if (images.isNotEmpty()) {
+        var fileId = presetFileId
+        if (fileId == null && images.isNotEmpty()) {
             try {
                 val (data, ctype) = misskey.download(images[0])
-                val ext = ctype.split("/", limit = 2).getOrNull(1) ?: "jpg"
+                val ext = ctype.substringAfter("/", "jpg").substringBefore("+")
                 fileId = misskey.uploadDriveFile(token, data, "qq_${UUID.randomUUID().toString().take(8)}.$ext", ctype)
-                if (images.size > 1) {
-                    msgText += "\n[还有 ${images.size - 1} 张图片未发送]"
-                }
             } catch (e: RateLimitError) {
                 throw e
             } catch (e: Exception) {
                 BridgeLog.w("图片上传失败: $e")
-                msgText += "\n[图片上传失败]"
+                sendText(ctx.chan, if (text.isBlank()) "❌ 图片上传失败，本条未发送。" else "⚠️ 图片上传失败，只发送了文字。")
+            }
+            if (fileId != null && images.size > 1) {
+                sendText(ctx.chan, "⚠️ 每条消息只能附带 1 张图片，已发送第 1 张。")
             }
         }
+        if (text.isBlank() && fileId == null) return false
 
-        val sessionId0 = ensureSession(ctx.chan, binding)
-        sessionChan[sessionId0] = ctx.chan
-        val (sessionId, res) = sendAgent(token, ctx, binding, sessionId0, msgText, fileId)
-        sessionChan[sessionId] = ctx.chan
+        var sid = ensureSession(ctx.chan)
+        val typing = startTyping(ctx.chan)
+        val res: AgentSendResult
+        try {
+            val pair = sendWithRecovery(ctx.chan, token, sid, text, fileId)
+            sid = pair.first
+            res = pair.second
+        } finally {
+            typing?.cancel()
+        }
 
-        if (!res.optBoolean("ok", true)) {
-            sendText(ctx.chan, "❌ 发送失败：${res.optString("error").ifBlank { "未知错误" }}")
-            return res
+        if (!res.ok) {
+            if (!res.silent) sendText(ctx.chan, "❌ ${res.error ?: "发送失败"}")
+            return false
         }
-        val replyText = if (res.isNull("reply_text")) null else res.optString("reply_text")
-        if (replyText != null) {
-            rememberText(ctx.chan, replyText)
-            val replyId = if (res.isNull("reply_message_id")) null else res.optString("reply_message_id")
-            if (!replyId.isNullOrBlank()) markId(ctx.chan, replyId)
-            renderAndSendReply(ctx.chan, binding, replyText, replyId)
+        val replyText = res.replyText
+        if (replyText == null) {
+            if (res.silent) misskey.sessionsRead(token, sid)
+            return !res.silent
         }
-        return res
+        res.replyMessageId?.let { markId(ctx.chan, it) }
+        // 服务端 3 秒内未读就会推送提醒，分段发送可能超过这个时间，所以先标记已读再发
+        markReadAsync(token, sid)
+        renderAndSendReply(ctx.chan, token, sid, replyText, res.replyMessageId)
+        return false
     }
+
+    /**
+     * 发送并处理可自愈的错误：会话被删则换会话重发，文风失效则补订阅后重发。
+     * 发送期间登记 inflight，供 /stop 中止。
+     */
+    private suspend fun sendWithRecovery(
+        chan: String,
+        token: String,
+        sessionId: String,
+        text: String,
+        fileId: String?,
+    ): Pair<String, AgentSendResult> {
+        var sid = sessionId
+        var attempt = 0
+        while (true) {
+            val requestId = UUID.randomUUID().toString()
+            inflight[chan] = Inflight(token, sid, requestId)
+            try {
+                return sid to misskey.agentsSend(token, sid, text, fileId, requestId)
+            } catch (e: MisskeyAPIError) {
+                if (e is BannedError || e is AuthError || e is RateLimitError || attempt > 0) throw e
+                when (e.code) {
+                    "NO_SUCH_SESSION" -> {
+                        BridgeLog.w("会话已失效，换会话重发 (通道 $chan)")
+                        invalidateSession(sid)
+                        setChanCurrentSession(chan, null)
+                        sid = ensureSession(chan)
+                    }
+                    "AGENT_DIALOGUE_STYLE_REQUIRED", "STYLE_NOT_AVAILABLE", "STYLE_NOT_SUBSCRIBED" -> {
+                        BridgeLog.w("会话文风不可用，恢复默认文风后重发 (通道 $chan)")
+                        misskey.ensureStyleSubscribed(token, cfg.misskey.dialogueStyleId)
+                        misskey.sessionsUpdate(token, sid, JSONObject().put("dialogueStyleId", cfg.misskey.dialogueStyleId))
+                        invalidateSession(sid)
+                    }
+                    else -> throw e
+                }
+                attempt++
+            } finally {
+                inflight.remove(chan)
+            }
+        }
+    }
+
+    /** /stop：中止当前正在生成的回复。 */
+    fun abortReply(chan: String): String {
+        val f = inflight[chan] ?: return "当前没有正在生成的回复。"
+        return if (misskey.agentsAbort(f.token, f.sessionId, f.requestId)) "⏹ 已中止本次回复。"
+        else "回复已经生成完毕，来不及中止了。"
+    }
+
+    fun isReplying(chan: String): Boolean = inflight.containsKey(chan)
+
+    /** /retry：撤回最近一轮并用原消息重新生成。 */
+    suspend fun retryLast(ctx: ChatContext): String {
+        val binding = requireBinding(ctx)
+        if (isReplying(ctx.chan)) return "回复还在生成中，请稍等或先发送 /stop。"
+        val token = binding.str("misskey_token")
+        val sid = ensureSession(ctx.chan)
+        val last = misskey.agentsTimeline(token, sid, limit = 20).firstOrNull { it.optString("role") == "user" }
+            ?: return "当前会话还没有可以重新生成的消息。"
+        val res = misskey.agentsRollback(token, sid, last.optString("id"))
+        val content = res.optString("content").ifBlank { last.optString("content") }
+        val fileId = last.optJSONObject("file")?.optString("id")?.ifBlank { null }
+        val pipe = mapsLock.withLock { pipes.getOrPut(ctx.chan) { ChatPipe() } }
+        scope.launch {
+            pipe.replyEvent.clear()
+            if (sendRound(ctx, content, emptyList(), fileId, useSink = false)) waitStreamReply(ctx, pipe)
+        }
+        return "🔄 正在重新生成…"
+    }
+
+    /** /undo：撤回最近一轮对话（最后一条用户消息及之后的回复）。 */
+    suspend fun undoLast(ctx: ChatContext): String {
+        val binding = requireBinding(ctx)
+        if (isReplying(ctx.chan)) return "回复还在生成中，请稍等或先发送 /stop。"
+        val token = binding.str("misskey_token")
+        val sid = ensureSession(ctx.chan)
+        val last = misskey.agentsTimeline(token, sid, limit = 20).firstOrNull { it.optString("role") == "user" }
+            ?: return "当前会话没有可以撤回的消息。"
+        val res = misskey.agentsRollback(token, sid, last.optString("id"))
+        val preview = ReplyRender.plainText(res.optString("content")).replace("\n", " ").let {
+            if (it.length > 40) it.take(40) + "…" else it
+        }
+        return "↩️ 已撤回上一轮对话（删除 ${res.optInt("deletedCount")} 条消息）" +
+            (if (preview.isNotBlank()) "：\n「$preview」" else "")
+    }
+
+    // ---------- AI 回复渲染 ----------
 
     private suspend fun renderAndSendReply(
         chan: String,
-        binding: Map<String, Any?>,
+        token: String,
+        sessionId: String,
         text: String,
         messageId: String?,
         prefix: String = "",
-        extraImages: List<String> = emptyList(),
     ) {
-        val sessionId = binding.strOrNull("current_session_id") ?: ""
-        val rendered = ReplyRender.renderReply(
-            misskey,
-            binding.str("misskey_token"),
-            sessionId,
+        val info = sessions[sessionId] ?: try {
+            loadSession(token, sessionId)
+        } catch (e: Exception) {
+            BridgeLog.w("读取会话详情失败，按默认设置渲染: $e")
+            null
+        }
+        val rendered = ReplyRender.render(
             text,
-            messageId,
-            segEnabledMap[chan] ?: true,
+            splitEnabled = info?.segmented ?: true,
+            resolveEmoji = { misskey.emojiUrl(it) },
+            resolveSticker = { info?.stickers?.get(it) },
         )
-        val allImages = rendered.images + extraImages
-        if (rendered.messages.isNotEmpty()) {
-            rendered.messages.forEachIndexed { i, blocks ->
-                val segs = ArrayList<JSONObject>()
-                val bodyParts = StringBuilder()
-                for (b in blocks) {
-                    if (b.isImage) {
-                        segs.add(
-                            JSONObject().put("type", "image")
-                                .put("data", JSONObject().put("file", b.value))
-                        )
-                    } else {
-                        bodyParts.append(b.value)
-                        segs.add(
-                            JSONObject().put("type", "text")
-                                .put("data", JSONObject().put("text", b.value))
-                        )
-                    }
-                }
-                val body = bodyParts.toString()
-                if (i == 0 && prefix.isNotEmpty()) {
-                    if (segs.isNotEmpty() && segs[0].optString("type") == "text") {
-                        segs[0].getJSONObject("data").put("text", prefix + segs[0].getJSONObject("data").optString("text"))
-                    } else {
-                        segs.add(0, JSONObject().put("type", "text").put("data", JSONObject().put("text", prefix)))
-                    }
-                }
-                if (segs.isEmpty()) return@forEachIndexed
-                try {
-                    platform.sendTo(chan, segs)
-                } catch (e: Exception) {
-                    BridgeLog.e("发送 QQ 混排消息失败 (通道 $chan)", e)
-                }
-                if (i < rendered.messages.size - 1) {
-                    delay(ReplyRender.segmentDelayMs(body).toLong())
-                }
+        rendered.messages.forEachIndexed { i, blocks ->
+            val withPrefix = if (i == 0 && prefix.isNotEmpty()) {
+                val first = blocks.firstOrNull()
+                if (first != null && !first.isImage) listOf(first.copy(value = prefix + first.value)) + blocks.drop(1)
+                else listOf(ContentBlock("text", prefix.trimEnd())) + blocks
+            } else blocks
+            sendBlocks(chan, withPrefix)
+            if (i < rendered.messages.size - 1) {
+                delay(ReplyRender.segmentDelayMs(blocks.filter { !it.isImage }.joinToString("") { it.value }))
             }
-            for (url in allImages) {
-                val inlined = rendered.messages.any { blocks ->
-                    blocks.any { it.isImage && it.value == url }
-                }
-                if (inlined) continue
-                sendText(chan, "", imageUrl = url)
+        }
+        if (rendered.messages.isEmpty() && rendered.drawCount > 0 && prefix.isNotEmpty()) {
+            sendText(chan, prefix.trimEnd())
+        }
+        if (rendered.drawCount > 0) {
+            if (messageId == null) {
+                BridgeLog.w("回复含画图指令但缺少消息 id，无法生成图片 (通道 $chan)")
+                return
             }
+            // 生图可能要几十秒，期间继续显示“正在输入”
+            val typing = startTyping(chan)
+            try {
+                for (index in 0 until rendered.drawCount) {
+                    val (url, reason) = misskey.generatePlaceholder(token, sessionId, messageId, index)
+                    if (url != null) sendText(chan, "", imageUrl = url)
+                    else sendText(chan, "（图片${if (rendered.drawCount > 1) " ${index + 1}" else ""}生成失败：$reason）")
+                }
+            } finally {
+                typing?.cancel()
+            }
+        }
+    }
+
+    private suspend fun sendBlocks(chan: String, blocks: List<ContentBlock>) {
+        if (blocks.none { it.isImage }) {
+            sendText(chan, blocks.joinToString("") { it.value })
             return
         }
-
-        val segments = rendered.segments.ifEmpty {
-            if (text.trim().isNotEmpty()) listOf(text.trim()) else emptyList()
-        }
-        segments.forEachIndexed { i, seg ->
-            val body = if (i == 0) prefix + seg else seg
-            sendText(chan, body)
-            if (i < segments.size - 1) {
-                delay(ReplyRender.segmentDelayMs(seg).toLong())
-            }
-        }
-        if (segments.isNotEmpty() && allImages.isNotEmpty()) {
-            delay(REPLY_IMAGE_DELAY_MS)
-        }
-        for (url in allImages) {
-            sendText(chan, "", imageUrl = url)
+        val segs = blocks.map { if (it.isImage) imageSeg(it.value) else textSeg(it.value) }
+        try {
+            platform.sendTo(chan, segs)
+        } catch (e: Exception) {
+            BridgeLog.e("发送 QQ 图文消息失败 (通道 $chan)", e)
         }
     }
 
@@ -825,21 +966,6 @@ class Bridge(
     }
 
     // ---------- Misskey → QQ ----------
-
-    private fun rememberText(chan: String, text: String) {
-        val dq = recentTexts.getOrPut(chan) { ArrayDeque() }
-        synchronized(dq) {
-            dq.addLast(text.trim())
-            while (dq.size > TEXT_DEDUP_SIZE) dq.removeFirst()
-        }
-    }
-
-    private fun seenText(chan: String, text: String): Boolean {
-        val normalized = text.trim()
-        if (normalized.isEmpty()) return false
-        val dq = recentTexts[chan] ?: return false
-        return synchronized(dq) { normalized in dq }
-    }
 
     private fun markId(chan: String, msgId: String): Boolean {
         val lru = deliveredIds.getOrPut(chan) { LinkedHashMap() }
@@ -863,170 +989,120 @@ class Bridge(
         }
     }
 
+    /**
+     * newAgentMessage：AI 回复在 3 秒内未被阅读时推送，涵盖主动消息与 send 超时后补到的回复。
+     * 事件里的 messageText 只是 200 字预览，正文从时间线取。
+     */
     private suspend fun handleAgentMessage(chan: String, msg: JSONObject) {
         val binding = getBindingByChan(chan) ?: return
-        val msgId = msg.optString("messageId", "")
-        val text = msg.optString("messageText", "")
-        if (msgId.isNotEmpty() && !markId(chan, msgId)) return
-        val payloadSid = msg.optString("sessionId", "")
-        val boundSid = binding.strOrNull("current_session_id") ?: ""
-        if (payloadSid.isNotEmpty() && boundSid.isNotEmpty() && payloadSid != boundSid) return
-        if (payloadSid.isNotEmpty() && sessionChan[payloadSid] != null && sessionChan[payloadSid] != chan) return
-        if (seenText(chan, text)) return
-        if (text.trim().isEmpty()) return
-        rememberText(chan, text)
-        val sessionName = msg.optString("sessionName").ifBlank { "Aliya" }
-        val file = msg.optJSONObject("file")
-        val fileUrl = file?.optString("url")?.ifBlank { null }
-        renderAndSendReply(
-            chan, binding, text, msgId.ifBlank { null },
-            prefix = "$sessionName：\n",
-            extraImages = if (fileUrl != null) listOf(fileUrl) else emptyList(),
-        )
+        val msgId = msg.optString("messageId")
+        val sid = msg.optString("sessionId")
+        if (msgId.isEmpty() || sid.isEmpty()) return
+        if (sid != binding.strOrNull("current_session_id")) return
+        if (!markId(chan, msgId)) return
+        val token = binding.str("misskey_token")
+        val full = try {
+            misskey.agentsTimeline(token, sid, limit = 10).firstOrNull { it.optString("id") == msgId }
+        } catch (e: Exception) {
+            BridgeLog.w("拉取消息正文失败，改用预览文本: $e")
+            null
+        }
+        if (full != null && full.optString("role") != "assistant") return
+        val text = full?.optString("content") ?: msg.optString("messageText")
+        if (text.isBlank()) return
+        val isReply = pipes[chan]?.awaitingStream == true
+        val prefix = if (isReply) "" else "💌 ${sessions[sid]?.characterName ?: "Aliya"}（主动消息）\n"
+        markReadAsync(token, sid)
+        renderAndSendReply(chan, token, sid, text, msgId, prefix)
         signalReply(chan)
     }
 
     private suspend fun handleChat(chan: String, msg: JSONObject) {
         val binding = getBindingByChan(chan) ?: return
-        val msgId = msg.optString("id", "")
+        val msgId = msg.optString("id")
         if (msgId.isNotEmpty() && !markId(chan, msgId)) return
         val fromUser = msg.optJSONObject("fromUser") ?: JSONObject()
         val fromUserId = msg.optString("fromUserId").ifBlank { fromUser.optString("id") }
         if (fromUserId == binding.str("misskey_user_id")) return
-        val text = msg.optString("text", "")
-        val file = msg.optJSONObject("file")
-        val fileUrl = file?.optString("url")?.ifBlank { null }
+        if (!binding.bool("dm_enabled", true)) return
+        val text = if (msg.isNull("text")) "" else msg.optString("text")
+        val fileUrl = msg.optJSONObject("file")?.optString("url")?.ifBlank { null }
         if (text.isEmpty() && fileUrl == null) return
-        if (seenText(chan, text)) return
-
-        val isAi = fromUserId == cfg.misskey.characterId ||
-            fromUser.optString("username").lowercase() in AI_USERNAMES
-        val label = if (isAi) {
-            "${fromUser.optString("name").ifBlank { "Aliya" }}（AI）"
-        } else {
-            val bindingDm = binding.bool("dm_enabled", true)
-            if (!bindingDm) {
-                BridgeLog.i("通道 $chan 已关闭私信转发，丢弃来自 @${fromUser.optString("username")} 的消息")
-                return
-            }
-            "私信 ${fromUser.optString("name")} (@${fromUser.optString("username", "")})"
-        }
-        if (text.isNotEmpty()) rememberText(chan, text)
-        val body = text.ifEmpty { "[图片消息]" }
-        sendText(chan, "$label：\n$body", imageUrl = fileUrl)
-        signalReply(chan)
+        val name = fromUser.optString("name").takeIf { !fromUser.isNull("name") && it.isNotBlank() }
+            ?: fromUser.optString("username")
+        val room = msg.optJSONObject("toRoom")?.optString("name")?.ifBlank { null }
+        val label = if (room != null) "💬 群聊「$room」$name" else "💬 私信 $name (@${fromUser.optString("username")})"
+        sendText(chan, "$label：\n${text.ifEmpty { "[图片]" }}", imageUrl = fileUrl)
     }
 
     private suspend fun handleNotification(chan: String, ntf: JSONObject) {
         val binding = getBindingByChan(chan) ?: return
-        val ntype = ntf.optString("type")
-        if (ntype == "agentProactiveMessage") {
-            handleProactive(chan, binding, ntf)
-            signalReply(chan)
-            return
-        }
-        if (!binding.bool("notify_enabled", true)) return
-        val base = cfg.misskeyBaseUrl()
-        val user = ntf.optJSONObject("user") ?: JSONObject()
-        val uname = user.optString("name").ifBlank { user.optString("username") }.ifBlank { "有人" }
-        val handle = "$uname (@${user.optString("username", "")})"
-        val note = ntf.optJSONObject("note") ?: JSONObject()
-        when {
-            ntype in NOTIFY_LABELS -> {
-                val lines = ArrayList<String>()
-                lines.add("$handle ${NOTIFY_LABELS[ntype]}")
-                val noteText = note.optString("text", "")
-                if (noteText.isNotEmpty()) {
-                    lines.add(noteText.take(200) + (if (noteText.length > 200) "…" else ""))
-                }
-                if (note.has("id") && !note.isNull("id")) {
-                    lines.add("链接：$base/notes/${note.opt("id")}")
-                }
-                sendText(chan, lines.joinToString("\n"))
+        when (val ntype = ntf.optString("type")) {
+            // 封禁影响能否继续对话，不受通知开关控制
+            "agentSessionBanned" -> {
+                val sid = ntf.optString("sessionId")
+                invalidateSession(sid)
+                val banned = ntf.optBoolean("banned", true)
+                val isCurrent = sid == binding.strOrNull("current_session_id")
+                sendText(
+                    chan,
+                    if (banned) "⚠️ 会话「${ntf.optString("sessionName")}」已被封禁" + (if (isCurrent) "，发送 /new 新建会话后继续。" else "。")
+                    else "✅ 会话「${ntf.optString("sessionName")}」已解除封禁。"
+                )
             }
-            ntype == "follow" -> sendText(chan, "$handle 与你建立了关注关系")
-            ntype == "followed" -> sendText(chan, "$handle 关注了你")
-            ntype == "receiveFollowRequest" -> sendText(chan, "$handle 请求关注你，请在 Misskey 网页端处理")
-        }
-    }
-
-    private suspend fun handleProactive(chan: String, binding: Map<String, Any?>, ntf: JSONObject) {
-        val sessionId = ntf.optString("sessionId").ifBlank { binding.strOrNull("current_session_id") ?: "" }
-        if (sessionId.isEmpty()) return
-        val token = binding.str("misskey_token")
-        val lastSeen = binding.strOrNull("last_seen_message_id")
-        val msgs = try {
-            misskey.agentsTimeline(token, sessionId, limit = 20, sinceId = lastSeen)
-        } catch (e: Exception) {
-            BridgeLog.w("拉取主动消息失败 (通道 $chan): $e")
-            return
-        }
-        if (msgs.isEmpty()) return
-        var filtered = msgs.filter { !it.optBoolean("isInternal") }
-        if (filtered.isEmpty()) return
-        if (lastSeen.isNullOrBlank()) {
-            // 首次没有游标时只取最新一条，避免把历史记录全部推给用户
-            filtered = filtered.take(1)
-        }
-        val oldest = filtered.map { it.optString("id", "") }.filter { it.isNotEmpty() }.minByOrNull { it }
-        if (oldest != null) setChanLastSeen(chan, oldest)
-        for (m in filtered) {
-            if (m.optString("role") != "assistant") continue
-            val mid = m.optString("id", "")
-            val text = m.optString("content", "")
-            if (mid.isNotEmpty() && !markId(chan, mid)) continue
-            if (seenText(chan, text)) continue
-            val file = m.optJSONObject("file")
-            val fileUrl = file?.optString("url")?.ifBlank { null }
-            if (text.isNotEmpty()) rememberText(chan, text)
-            if (text.isEmpty() && fileUrl == null) continue
-            renderAndSendReply(
-                chan, binding, text.ifEmpty { "[图片消息]" }, mid.ifBlank { null },
-                prefix = "Aliya（主动消息）：\n",
-                extraImages = if (fileUrl != null) listOf(fileUrl) else emptyList(),
-            )
-        }
-    }
-
-    // ---------- 供 commands 使用的辅助 ----------
-
-    fun requestBindConfirm(ctx: ChatContext, kind: String, token: String = ""): String {
-        cancelPendingBind(ctx.chan)
-        val timeout = cfg.bindConfirmTimeout
-        val p = PendingBind(
-            chan = ctx.chan, qq = ctx.qq, kind = kind, token = token,
-            expiresAt = System.currentTimeMillis() / 1000.0 + timeout,
-        )
-        p.task = scope.launch {
-            delay((timeout * 1000).toLong().coerceAtLeast(100))
-            if (pendingBinds[ctx.chan] === p) {
-                pendingBinds.remove(ctx.chan)
-                sendText(p.chan, "QQ ${p.qq} 的绑定请求超时未确认，已自动取消。")
+            "agentCharacterBanned" -> {
+                sessions.values.removeIf { it.characterId == ntf.optString("characterId") }
+                if (ntf.optString("characterId") != cfg.misskey.characterId) return
+                sendText(
+                    chan,
+                    if (ntf.optBoolean("banned", true)) "⚠️ 角色「${ntf.optString("characterName")}」已被封禁，暂时无法对话。"
+                    else "✅ 角色「${ntf.optString("characterName")}」已解除封禁。"
+                )
+            }
+            else -> {
+                if (!binding.bool("notify_enabled", true)) return
+                val user = ntf.optJSONObject("user") ?: JSONObject()
+                val uname = user.optString("name").takeIf { !user.isNull("name") && it.isNotBlank() }
+                    ?: user.optString("username").ifBlank { "有人" }
+                val handle = "$uname (@${user.optString("username")})"
+                val note = ntf.optJSONObject("note") ?: JSONObject()
+                when {
+                    ntype in NOTIFY_LABELS -> {
+                        val lines = arrayListOf("🔔 $handle ${NOTIFY_LABELS[ntype]}")
+                        if (ntype == "reaction") ntf.optString("reaction").ifBlank { null }?.let { lines[0] += " $it" }
+                        val noteText = if (note.isNull("text")) "" else note.optString("text")
+                        if (noteText.isNotEmpty()) lines.add(noteText.take(200) + if (noteText.length > 200) "…" else "")
+                        note.optString("id").ifBlank { null }?.let { lines.add("${cfg.misskeyBaseUrl()}/notes/$it") }
+                        sendText(chan, lines.joinToString("\n"))
+                    }
+                    ntype == "follow" -> sendText(chan, "🔔 $handle 关注了你")
+                    ntype == "receiveFollowRequest" -> sendText(chan, "🔔 $handle 请求关注你，请在 Misskey 网页端处理")
+                    ntype == "followRequestAccepted" -> sendText(chan, "🔔 $handle 通过了你的关注请求")
+                }
             }
         }
-        pendingBinds[ctx.chan] = p
-        BridgeLog.i("群 ${ctx.groupId} 收到待确认绑定请求（QQ ${ctx.qq}，$kind）")
-        return "本群已有绑定。QQ ${ctx.qq} 发起的重新绑定请求需要管理员确认：\n" +
-            "管理员请在 ${timeout.toInt()} 秒内发送 /确认（超时自动取消）。"
     }
 
-    fun popPendingBind(chan: String): PendingBind? {
-        val p = pendingBinds.remove(chan) ?: return null
-        p.task?.cancel()
-        if (p.expiresAt > 0 && System.currentTimeMillis() / 1000.0 > p.expiresAt) return null
-        return p
+    private companion object {
+        const val GROUP_SINK_LIMIT = 50
     }
+}
 
-    private fun cancelPendingBind(chan: String) {
-        pendingBinds.remove(chan)?.task?.cancel()
+/**
+ * 按 QQ 单条长度上限切分长文本：优先在换行处断开，且不拆开代理对（emoji）。
+ */
+fun splitForQq(text: String, limit: Int): List<String> {
+    val max = limit.coerceAtLeast(100)
+    if (text.length <= max) return listOf(text)
+    val out = ArrayList<String>()
+    var rest = text
+    while (rest.length > max) {
+        var cut = rest.lastIndexOf('\n', max)
+        if (cut < max / 2) cut = max
+        if (Character.isHighSurrogate(rest[cut - 1])) cut--
+        out.add(rest.substring(0, cut).trimEnd())
+        rest = rest.substring(cut).trimStart('\n')
     }
-
-    fun cacheSessions(chan: String, sessions: List<JSONObject>) {
-        sessionCache[chan] = sessions
-    }
-
-    fun popCachedSession(chan: String, index: Int): JSONObject? {
-        val sessions = sessionCache[chan] ?: emptyList()
-        return if (index in 1..sessions.size) sessions[index - 1] else null
-    }
+    if (rest.isNotEmpty()) out.add(rest)
+    return out
 }

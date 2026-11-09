@@ -182,6 +182,15 @@ open class OneBotAdapter(
                 done.countDown()
             }
 
+            // 对端发来关闭帧（NapCat 重启/退出）时 OkHttp 只回调 onClosing，
+            // 不回应并放行的话 done 永远不会释放，连接卡死、不再重连
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                BridgeLog.w("OneBot WS 被对端关闭: $code $reason")
+                connected = false
+                webSocket.close(code, reason)
+                done.countDown()
+            }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 connected = false
                 done.countDown()

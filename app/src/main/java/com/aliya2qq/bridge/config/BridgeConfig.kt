@@ -66,6 +66,28 @@ data class BridgeConfig(
 ) {
     fun misskeyBaseUrl(): String = "${misskey.scheme}://${misskey.host}"
     fun misskeyStreamUrl(token: String): String = "${misskeyBaseUrl()}/streaming?i=$token"
+
+    /** 启动桥接前必须填写的字段，返回缺失项的中文名。 */
+    fun missingRequired(): List<String> = buildList {
+        if (misskey.host.isBlank()) add("Misskey 实例地址")
+        if (misskey.characterId.isBlank()) add("角色 ID")
+        if (misskey.dialogueStyleId.isBlank()) add("文风 ID")
+    }
+}
+
+/**
+ * 用户可能填 "https://example.com/" 或 "example.com"，拆成 scheme 与纯 host。
+ * scheme 未写时沿用 fallbackScheme。
+ */
+fun normalizeHost(input: String, fallbackScheme: String = "https"): Pair<String, String> {
+    var s = input.trim()
+    var scheme = fallbackScheme
+    Regex("^(https?)://", RegexOption.IGNORE_CASE).find(s)?.let {
+        scheme = it.groupValues[1].lowercase()
+        s = s.substring(it.range.last + 1)
+    }
+    s = s.substringBefore("/").substringBefore("?").trim()
+    return scheme to s
 }
 
 object ConfigLoader {
@@ -115,6 +137,10 @@ object ConfigLoader {
         val onebot = o.optJSONObject("onebot") ?: JSONObject()
         val misskey = o.optJSONObject("misskey") ?: JSONObject()
         val d = defaults("")
+        val (scheme, host) = normalizeHost(
+            misskey.optString("host", d.misskey.host),
+            misskey.optString("scheme", d.misskey.scheme).ifBlank { "https" },
+        )
         return BridgeConfig(
             platform = PlatformCfg(adapter = platform.optString("adapter", d.platform.adapter)),
             napcat = NapCatCfg(
@@ -137,10 +163,10 @@ object ConfigLoader {
                 reconnectInterval = onebot.optDouble("reconnect_interval", d.onebot.reconnectInterval),
             ),
             misskey = MisskeyCfg(
-                host = misskey.optString("host", d.misskey.host),
-                scheme = misskey.optString("scheme", d.misskey.scheme),
-                characterId = misskey.optString("character_id", d.misskey.characterId),
-                dialogueStyleId = misskey.optString("dialogue_style_id", d.misskey.dialogueStyleId),
+                host = host,
+                scheme = scheme,
+                characterId = misskey.optString("character_id", d.misskey.characterId).trim(),
+                dialogueStyleId = misskey.optString("dialogue_style_id", d.misskey.dialogueStyleId).trim(),
                 miauthName = misskey.optString("miauth_name", d.misskey.miauthName),
                 miauthPermission = misskey.optString("miauth_permission", d.misskey.miauthPermission),
                 timeoutNormal = misskey.optDouble("timeout_normal", d.misskey.timeoutNormal),

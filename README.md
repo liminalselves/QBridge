@@ -8,12 +8,32 @@
 ## 功能
 
 - 一键初始化：安装 Termux bootstrap、Debian rootfs、NTQQ 并注入 NapCat，全程日志可见
-- NapCat启停与探活；日志面板实时输出，自动识别登录二维码（字符画/图片）
-- WebUI自动登录：自动捕获并展示 NapCat WebUI Token，可复制、可在内嵌 WebView 自动填入
-- QQ 私聊/群聊与特定Misskey双向桥接：聊天转发、通知推送、主动消息、防连发合并、长回复分段
-- 等待 AI 回复期间自动刷新 QQ「正在输入」状态
+- 首页按步骤引导，环境 / QQ / 桥接三段状态各自启停；登录二维码（字符画/图片）直接显示在首页
+- WebUI 登录：自动捕获 NapCat WebUI Token，可复制或在内嵌 WebView 中打开
+- QQ 私聊/群聊与 Misskey 智能体会话双向桥接：
+  - AI 回复按分段设置拆条发送，角色表情包、全站表情转为图片，画图指令生成图片后补发
+  - 主动消息完整推送（含配图），送达后自动标记已读，不会在 Misskey 网页端重复提醒
+  - 会话/角色被封禁、Token 失效时在 QQ 内提示；常见错误给出中文说明
+  - Misskey 通知（提及/回复/反应等）与私信转发，可分别开关
+- 等待 AI 回复和生成图片期间，私聊显示 QQ「正在输入」
 - 群聊绑定与权限体系（绑定者 / 群管理员名单 / 全局管理员）
-- 全部聊天指令见 `/help`
+
+## 聊天指令
+
+直接发消息即可对话（群聊需 @机器人）。常用指令：
+
+| 指令 | 说明 |
+|------|------|
+| `/bind` · `/unbind` · `/me` | 绑定（MiAuth 或 `/bind <token>`）、解绑、查看账号与会话 |
+| `/retry` · `/undo` · `/stop` | 重新生成上一条、撤回上一轮、中止正在生成的回复 |
+| `/new` · `/sessions` · `/switch` · `/del` · `/rename` · `/history` | 会话管理 |
+| `/model` · `/style` · `/imgmodel` | 对话模型、文风、生图模型（列表后按编号选择） |
+| `/memory` · `/proactive` | 长期记忆、主动消息计划 |
+| `/balance` · `/checkin` | 余额、每日签到 |
+| `/set` | 通知 / 私信 / 分段输出 / 群消息感知开关 |
+| `/admin` · `/确认` | 群管理员名单、确认重新绑定 |
+
+完整说明发送 `/help` 查看。
 
 ## 系统要求
 
@@ -24,11 +44,13 @@
 
 ## 使用流程
 
-1. 安装 APK（Release 产物或自行构建）
-2. 打开应用，在「桥接设置」里填写 Misskey 实例地址、角色 ID、文风 ID，保存
-3. 点「初始化环境」，等待环境安装完成（耗时较长，日志有进度）
-4. 点「启动NapCat」，日志区出现二维码后用手机 QQ 扫码登录，或点「WebUI登录」
-5. 点「启动桥接」，QQ 与 Misskey 开始互通
+首页会按当前状态提示下一步，依次完成即可：
+
+1. 安装 APK（Release 产物或自行构建），首次打开允许「忽略电池优化」
+2. 「设置」页填写 Misskey 实例地址、角色 ID、文风 ID，保存（会逐项校验）
+3. 首次打开会自动初始化环境，也可在首页「运行环境」行手动点「初始化」
+4. 「QQ（NapCat）」行点「启动」，用机器人 QQ 扫描首页出现的二维码，或点「打开 WebUI」登录
+5. 「消息桥接」行点「启动」，然后在 QQ 里给机器人发 `/bind` 绑定 Misskey 账号
 
 ## 离线预置包
 
@@ -59,7 +81,7 @@
 sdk.dir=<Android SDK 路径>
 ```
 
-发布包另需签名四项，密钥库文件放在仓库外：
+发布包签名为可选项，填写以下四项后产出已签名 APK（未填写则为未签名包），密钥库文件放在仓库外：
 
 ```properties
 release.storeFile=<密钥库文件路径>
@@ -102,35 +124,40 @@ gradle :app:assembleRelease   # 发布包 → app/build/outputs/apk/release/
 
 ## 配置
 
-常用配置在应用内「桥接设置」面板完成，主要字段：
+常用配置在应用内「设置」页完成，保存在应用私有目录的 `config.json`（字段示例见 `config.example.json`）：
 
 | 字段 | 说明 |
 |------|------|
-| `platform.adapter` | `napcat` 或 `onebot` |
-| `napcat.ws_url` | NapCat 正向 WS 地址，默认 `ws://127.0.0.1:3001` |
-| `misskey.host` / `character_id` / `dialogue_style_id` | Misskey 实例与角色（必填） |
+| `misskey.host` / `character_id` / `dialogue_style_id` | Misskey 实例与角色（必填）；地址可带 `https://`，保存时自动规范化 |
 | `allowed_qq` / `allowed_groups` | 私聊 QQ 白名单 / 群白名单，留空不限制 |
 | `admin_qq` | 全局管理员 QQ 列表 |
+| `command_prefix` | 指令前缀，默认 `/` |
+| `platform.adapter` / `napcat.ws_url` | 「高级选项」：`napcat` 或 `onebot`；NapCat 正向 WS 默认 `ws://127.0.0.1:3001` |
+
+桥接运行中修改设置，保存时会提示是否重启桥接使其生效。
 
 ## 项目结构
 
 ```
 app/src/main/java/com/aliya2qq/bridge/
-├── core/          桥接核心：消息路由、防连发管线、去重
+├── core/          桥接核心：消息路由、防连发管线、会话缓存、去重
 ├── commands/      QQ 聊天指令
+├── config/        配置加载与校验
 ├── platforms/     NapCat / OneBot 协议适配器
-├── misskey/       Misskey HTTP API 与流式监听
-├── render/        AI 回复渲染：画图指令、表情、分段
+├── misskey/       Misskey HTTP API、错误码中文说明、流式监听
+├── render/        AI 回复渲染：画图指令、表情包/表情、分段
 ├── db/            SQLite 持久化
 ├── engine/        环境安装（bootstrap/rootfs/NTQQ）、Shell 执行、NapCat 生命周期、日志泵
 ├── service/       前台服务
-└── ui/            控制台界面
+├── util/          日志与异步工具
+└── ui/            控制台界面（首页 / 设置 / 日志）
 ```
 
 ## 常见问题
 
 - **初始化下载慢或失败**：可使用离线预置包，手动放置文件或启用加速器重试。
-- **如何登录**：日志栏与napcat WebUI均可登录，推荐进入napcat WebUI登录。
+- **如何登录**：首页「QQ 登录」卡片的二维码与 NapCat WebUI 均可登录。
+- **QQ 提示 Token 已失效**：在 QQ 里重新发送 `/bind`。
 - **QQ端无响应**：应用首次启动会申请电池优化白名单，请在系统弹窗中允许。
 
 ## 许可

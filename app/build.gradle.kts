@@ -24,8 +24,8 @@ android {
         applicationId = "com.aliya2qq.bridge"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "1.6.5-opensource"
+        versionCode = 16
+        versionName = "1.7.0-agent-sync"
         // 内部分发：仅 arm64-v8a
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -40,12 +40,16 @@ android {
         }
     }
 
-    signingConfigs {
-        create("release") {
-            storeFile = rootProject.file(localProps.getProperty("release.storeFile", ""))
-            storePassword = localProps.getProperty("release.storePassword", "")
-            keyAlias = localProps.getProperty("release.keyAlias", "")
-            keyPassword = localProps.getProperty("release.keyPassword", "")
+    // 发布签名可选：未配置时调试包照常构建，发布包产出未签名 APK
+    val releaseStoreFile = localProps.getProperty("release.storeFile", "")
+    if (releaseStoreFile.isNotBlank()) {
+        signingConfigs {
+            create("release") {
+                storeFile = rootProject.file(releaseStoreFile)
+                storePassword = localProps.getProperty("release.storePassword", "")
+                keyAlias = localProps.getProperty("release.keyAlias", "")
+                keyPassword = localProps.getProperty("release.keyPassword", "")
+            }
         }
     }
 
@@ -53,7 +57,7 @@ android {
         release {
             isMinifyEnabled = false
             isShrinkResources = false
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

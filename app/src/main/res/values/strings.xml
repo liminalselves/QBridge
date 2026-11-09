@@ -1,12 +1,117 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">QBridge</string>
-    <!-- 与官方 Termux（com.termux）独立共存 -->
-    <string name="btn_start">启动桥接</string>
-    <string name="btn_stop">停止桥接</string>
-    <string name="btn_save_config">保存配置</string>
-    <string name="btn_reload_config">重新加载</string>
+    <string name="subtitle">把 Misskey 上的 AI 角色带到 QQ</string>
     <string name="notification_channel">桥接服务</string>
-    <string name="notification_title">QBridge</string>
-    <string name="notification_text">桥接服务运行中</string>
+    <string name="notification_title">QBridge 运行中</string>
+    <string name="notification_text">QQ 与 Misskey 正在互通</string>
+
+    <string name="tab_home">首页</string>
+    <string name="tab_settings">设置</string>
+    <string name="tab_log">日志</string>
+
+    <!-- 首页引导 -->
+    <string name="hint_checking">正在检查环境…</string>
+    <string name="hint_config_title">第 1 步：填写设置</string>
+    <string name="hint_config_body">需要填写：%1$s。</string>
+    <string name="hint_config_action">去填写</string>
+    <string name="hint_init_title">第 2 步：初始化环境</string>
+    <string name="hint_init_body">首次使用需要安装运行环境，大约需要几分钟，期间请保持应用在前台。</string>
+    <string name="hint_installing_title">正在初始化环境</string>
+    <string name="hint_installing_body">进度见「日志」页，完成后会自动进入下一步。</string>
+    <string name="hint_napcat_title">第 3 步：启动 QQ</string>
+    <string name="hint_napcat_body">启动后用手机 QQ 扫码登录机器人账号。</string>
+    <string name="hint_starting_title">QQ 启动中</string>
+    <string name="hint_starting_body">冷启动需要十几秒，二维码出现后会显示在下方。</string>
+    <string name="hint_login_title">第 4 步：扫码登录</string>
+    <string name="hint_login_body">用机器人 QQ 号扫描下方二维码，或通过 WebUI 登录。已登录过的可直接启动桥接。</string>
+    <string name="hint_bridge_title">最后一步：启动桥接</string>
+    <string name="hint_bridge_body">QQ 登录完成后启动桥接，QQ 与 Misskey 就会开始互通。</string>
+    <string name="hint_ready_title">一切就绪</string>
+    <string name="hint_ready_body">在 QQ 里给机器人发 /bind 绑定 Misskey 账号，之后直接聊天即可。发送 /help 查看全部指令。</string>
+    <string name="hint_error_title">环境出错</string>
+    <string name="hint_error_body">查看「日志」页了解原因，修复后可重试初始化。</string>
+
+    <!-- 状态行 -->
+    <string name="row_env">运行环境</string>
+    <string name="row_napcat">QQ（NapCat）</string>
+    <string name="row_bridge">消息桥接</string>
+    <string name="st_env_missing">未安装</string>
+    <string name="st_env_partial">待安装 NapCat</string>
+    <string name="st_env_installing">安装中…</string>
+    <string name="st_env_ready">已就绪</string>
+    <string name="st_env_error">出错，可重试</string>
+    <string name="st_napcat_off">未启动</string>
+    <string name="st_napcat_starting">启动中…</string>
+    <string name="st_napcat_running">运行中</string>
+    <string name="st_napcat_login">运行中 · 待扫码登录</string>
+    <string name="st_napcat_stopping">停止中…</string>
+    <string name="st_napcat_unavailable">需先完成环境初始化</string>
+    <string name="st_bridge_off">未启动</string>
+    <string name="st_bridge_on">运行中 · %1$s</string>
+    <string name="act_init">初始化</string>
+    <string name="act_retry">重试</string>
+    <string name="act_start">启动</string>
+    <string name="act_stop">停止</string>
+
+    <string name="login_title">QQ 登录</string>
+    <string name="login_desc">用机器人 QQ 号扫码；二维码过期时 NapCat 会自动刷新</string>
+    <string name="btn_webui">打开 WebUI</string>
+    <string name="btn_copy_token">复制 Token</string>
+    <string name="home_footer">保持应用后台运行：首次启动请允许“忽略电池优化”</string>
+
+    <!-- 设置 -->
+    <string name="sec_misskey">Misskey</string>
+    <string name="sec_misskey_desc">桥接到哪个实例的哪个 AI 角色（必填）</string>
+    <string name="f_host">实例地址</string>
+    <string name="f_host_help">如 misskey.example.com，可带 https://</string>
+    <string name="f_character">角色 ID</string>
+    <string name="f_character_help">角色详情页地址里的 ID</string>
+    <string name="f_style">文风 ID</string>
+    <string name="f_style_help">新会话默认使用的文风，会自动订阅</string>
+    <string name="sec_access">谁可以使用</string>
+    <string name="sec_access_desc">多个号码用逗号分隔；白名单留空表示不限制</string>
+    <string name="f_allowed_qq">私聊白名单 QQ</string>
+    <string name="f_allowed_groups">群聊白名单群号</string>
+    <string name="f_admin_qq">全局管理员 QQ</string>
+    <string name="f_admin_qq_help">可在任意群管理绑定与管理员名单</string>
+    <string name="f_prefix">指令前缀</string>
+    <string name="sec_qq">QQ 与 NapCat</string>
+    <string name="f_qq_uin">机器人 QQ 号（可空）</string>
+    <string name="f_qq_uin_help">填写后下次启动尝试快速登录，免扫码</string>
+    <string name="advanced_show">显示高级选项</string>
+    <string name="advanced_hide">收起高级选项</string>
+    <string name="f_adapter">协议适配器</string>
+    <string name="f_ws">NapCat 正向 WS 地址</string>
+    <string name="f_ws_token">access_token（可空）</string>
+    <string name="btn_save">保存设置</string>
+    <string name="save_hint">保存后自动返回首页；桥接运行中会提示是否重启生效</string>
+
+    <string name="err_required">必填</string>
+    <string name="err_host">地址格式不正确</string>
+    <string name="err_numbers">只能填写数字号码，用逗号分隔</string>
+    <string name="err_ws">需以 ws:// 或 wss:// 开头</string>
+    <string name="err_prefix">不能为空，且不能含空格</string>
+    <string name="toast_saved">设置已保存</string>
+    <string name="toast_fix_fields">请先修正标红的设置项</string>
+    <string name="dlg_restart_title">重启桥接？</string>
+    <string name="dlg_restart_msg">新设置需要重启桥接后生效。</string>
+    <string name="dlg_restart_ok">立即重启</string>
+    <string name="dlg_later">稍后</string>
+    <string name="dlg_stop_napcat_title">停止 QQ？</string>
+    <string name="dlg_stop_napcat_msg">桥接正在运行，停止 QQ 后消息将无法收发。</string>
+    <string name="dlg_cancel">取消</string>
+    <string name="toast_need_config">请先在「设置」里填写：%1$s</string>
+    <string name="toast_token_missing">Token 尚未生成，请先启动 QQ</string>
+    <string name="toast_token_copied">Token 已复制</string>
+    <string name="toast_log_copied">日志已复制</string>
+
+    <!-- 日志 -->
+    <string name="log_all">全部</string>
+    <string name="log_bridge">桥接</string>
+    <string name="log_error">警告/错误</string>
+    <string name="log_copy">复制日志</string>
+    <string name="log_clear">清空日志</string>
+    <string name="log_follow">回到最新</string>
+    <string name="log_empty">暂无日志</string>
 </resources>

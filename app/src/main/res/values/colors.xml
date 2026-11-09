@@ -17,6 +17,7 @@
     <color name="app_surface_variant">#E3E4EE</color>
     <color name="app_on_surface_variant">#464A54</color>
     <color name="app_outline">#C5C8D4</color>
+    <color name="app_outline_soft">#E1E3EC</color>
 
     <!-- 状态圆点 -->
     <color name="dot_green">#2ECC71</color>

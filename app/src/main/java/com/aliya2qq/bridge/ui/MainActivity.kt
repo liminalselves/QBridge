@@ -6,30 +6,35 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.PowerManager
-import android.provider.Settings
 import android.content.res.ColorStateList
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Paint
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.text.SpannableStringBuilder
 import android.text.Spanned
-import android.text.style.AbsoluteSizeSpan
-import android.util.Log
+import android.text.style.ForegroundColorSpan
+import android.util.TypedValue
 import android.view.View
 import android.widget.ArrayAdapter
-import android.widget.ScrollView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.widget.doAfterTextChanged
 import com.aliya2qq.bridge.R
 import com.aliya2qq.bridge.config.BridgeConfig
 import com.aliya2qq.bridge.config.ConfigLoader
+import com.aliya2qq.bridge.config.normalizeHost
 import com.aliya2qq.bridge.databinding.ActivityMainBinding
+import com.aliya2qq.bridge.databinding.ItemStatusRowBinding
 import com.aliya2qq.bridge.engine.LogPump
 import com.aliya2qq.bridge.engine.NapCatManager
 import com.aliya2qq.bridge.engine.NapCatState
@@ -37,67 +42,97 @@ import com.aliya2qq.bridge.engine.SetupOrchestrator
 import com.aliya2qq.bridge.engine.ShellExec
 import com.aliya2qq.bridge.service.BridgeService
 import com.aliya2qq.bridge.util.BridgeLog
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.tabs.TabLayout
+import com.google.android.material.textfield.TextInputLayout
 import java.io.File
 import java.util.concurrent.Executors
 
 /**
- * 唯一用户界面：状态卡片 + 主按钮 + 「设置 / 日志」标签页共享区域。
- * 设置面板通过下拉框在 NapCat / 桥接两个子面板间切换，统一用「保存设置」手动保存。
- * 日志页含 WebUI Token 栏与运行日志（含二维码）。
+ * 唯一用户界面，三个标签页：
+ * - 首页：下一步引导、环境 / QQ / 桥接三段状态与启停、扫码登录
+ * - 设置：Misskey、使用范围、QQ 与 NapCat 三组表单，保存时逐项校验
+ * - 日志：可筛选的运行日志
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
+    private lateinit var rowEnv: ItemStatusRowBinding
+    private lateinit var rowNapcat: ItemStatusRowBinding
+    private lateinit var rowBridge: ItemStatusRowBinding
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
     private var logPump: LogPump? = null
 
-    private val stateListener: (NapCatState) -> Unit = { s ->
-        mainHandler.post { renderState(s) }
-    }
+    /** 日志面板只渲染最近这么多行，避免 TextView 无限增长卡顿。 */
+    private val logViewLimit = 600
+    private var logFilter = LogFilter.ALL
+    private var followLog = true
+
+    /** BridgeLog 的回调来自任意线程，用原子标记合并刷新。 */
+    private val pendingLogRefresh = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    @Volatile
+    private var webUiToken: String? = null
+
+    private enum class LogFilter { ALL, BRIDGE, ERROR }
+
+    private val stateListener: (NapCatState) -> Unit = { mainHandler.post { renderState() } }
+    private val logListener: (String) -> Unit = { scheduleLogRefresh() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        rowEnv = binding.rowEnv
+        rowNapcat = binding.rowNapcat
+        rowBridge = binding.rowBridge
+        setupRows()
+        setupTabs()
+        setupSettings()
+        setupLogPanel()
+        setupLoginCard()
+        loadConfigIntoUi()
+
         requestNotifPermission()
         requestBatteryWhitelist()
-        binding.tvLog.typeface = Typeface.MONOSPACE
-        setupTabs()
-        setupSettingsDropdown()
-        loadConfigIntoUi()
-        bindButtons()
+
         NapCatManager.addStateListener(stateListener)
-        BridgeLog.listener = { line ->
-            mainHandler.post {
-                appendLog(line)
-            }
-        }
-        binding.tvLog.text = BridgeLog.buffer.joinToString("\n")
-        if (binding.etNapcatWs.text.isNullOrBlank()) {
-            binding.etNapcatWs.setText("ws://127.0.0.1:3001")
-        }
+        BridgeService.onStateChanged = { mainHandler.post { renderState() } }
+        BridgeLog.listener = logListener
+        refreshLog()
+        renderState()
 
         io.execute {
             SetupOrchestrator.extractAssets(this)
             NapCatManager.refreshState(this)
+            refreshTokenAsync()
+            // 首次打开自动开始初始化（离线预置包下无需联网）
             val s = NapCatManager.state
             if (s == NapCatState.NEED_BOOTSTRAP || s == NapCatState.NEED_INSTALL) {
-                appendLogSafe("» 自动开始初始化…")
-                SetupOrchestrator.initialize(this) { msg ->
-                    mainHandler.post { appendLog(msg) }
-                }
+                BridgeLog.raw("» 自动开始初始化…")
+                SetupOrchestrator.initialize(this) { msg -> BridgeLog.raw("» $msg") }
             }
         }
         startLogPump()
     }
 
+    override fun onResume() {
+        super.onResume()
+        renderState()
+    }
+
     override fun onDestroy() {
         logPump?.stop()
         NapCatManager.removeStateListener(stateListener)
-        BridgeLog.listener = null
+        BridgeService.onStateChanged = null
+        if (BridgeLog.listener === logListener) BridgeLog.listener = null
+        mainHandler.removeCallbacksAndMessages(null)
+        io.shutdown()
         super.onDestroy()
     }
+
+    // ---------- 权限 ----------
 
     /** 首次启动申请电池优化白名单：防系统/厂商策略杀掉后台 proot/QQ 子进程。 */
     private fun requestBatteryWhitelist() {
@@ -105,10 +140,7 @@ class MainActivity : AppCompatActivity() {
         if (pm.isIgnoringBatteryOptimizations(packageName)) return
         try {
             startActivity(
-                Intent(
-                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:$packageName"),
-                )
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
             )
         } catch (_: Exception) {
             try {
@@ -119,46 +151,281 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestNotifPermission() {
-        if (Build.VERSION.SDK_INT >= 33) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
-            }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
         }
     }
 
-    /** 设置 / 日志 标签页切换（共享同一显示区域）。 */
+    // ---------- 标签页 ----------
+
     private fun setupTabs() {
         binding.tabs.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
-            override fun onTabSelected(tab: TabLayout.Tab) {
-                switchPanel(tab.position == 0)
-            }
-
+            override fun onTabSelected(tab: TabLayout.Tab) = showPanel(tab.position)
             override fun onTabUnselected(tab: TabLayout.Tab) {}
             override fun onTabReselected(tab: TabLayout.Tab) {}
         })
     }
 
-    private fun switchPanel(showSettings: Boolean) {
-        binding.panelSettings.visibility = if (showSettings) View.VISIBLE else View.GONE
-        binding.panelLog.visibility = if (showSettings) View.GONE else View.VISIBLE
+    private fun showPanel(pos: Int) {
+        binding.panelHome.visibility = if (pos == 0) View.VISIBLE else View.GONE
+        binding.panelSettings.visibility = if (pos == 1) View.VISIBLE else View.GONE
+        binding.panelLog.visibility = if (pos == 2) View.VISIBLE else View.GONE
+        if (pos == 2) refreshLog()
     }
 
-    /** 出现二维码等登录信息时自动切到日志页。 */
-    private fun showLogTab() {
-        if (binding.tabs.selectedTabPosition != 1) binding.tabs.getTabAt(1)?.select()
+    private fun selectTab(pos: Int) {
+        if (binding.tabs.selectedTabPosition != pos) binding.tabs.getTabAt(pos)?.select()
     }
 
-    /** 下拉框切换 NapCat / 桥接 两个设置子面板。 */
-    private fun setupSettingsDropdown() {
-        val items = listOf("NapCat 设置", "桥接设置")
-        binding.spinnerPanel.setAdapter(ArrayAdapter(this, R.layout.item_dropdown_menu, items))
-        binding.spinnerPanel.setText(items[0], false)
-        binding.spinnerPanel.setOnItemClickListener { _, _, pos, _ ->
-            binding.panelNapcat.visibility = if (pos == 0) View.VISIBLE else View.GONE
-            binding.panelBridge.visibility = if (pos == 0) View.GONE else View.VISIBLE
+    // ---------- 首页 ----------
+
+    private fun setupRows() {
+        rowEnv.icon.setImageResource(R.drawable.ic_env)
+        rowEnv.title.setText(R.string.row_env)
+        rowNapcat.icon.setImageResource(R.drawable.ic_qq)
+        rowNapcat.title.setText(R.string.row_napcat)
+        rowBridge.icon.setImageResource(R.drawable.ic_bridge)
+        rowBridge.title.setText(R.string.row_bridge)
+
+        rowEnv.action.setOnClickListener { startInit() }
+        rowNapcat.action.setOnClickListener {
+            if (isNapcatActive(NapCatManager.state)) confirmStopNapcat() else startNapcat()
         }
+        rowBridge.action.setOnClickListener {
+            if (BridgeService.isRunning) stopBridge() else startBridge()
+        }
+    }
+
+    private fun isNapcatActive(s: NapCatState) =
+        s == NapCatState.RUNNING || s == NapCatState.WAIT_LOGIN || s == NapCatState.STARTING
+
+    private fun startInit() {
+        saveQuietly()
+        rowEnv.action.isEnabled = false
+        selectTab(2)
+        io.execute {
+            SetupOrchestrator.initialize(this) { msg -> BridgeLog.raw("» $msg") }
+        }
+    }
+
+    private fun startNapcat() {
+        saveQuietly()
+        rowNapcat.action.isEnabled = false
+        val uin = binding.etQqUin.text.toString().trim()
+        io.execute {
+            SetupOrchestrator.startNapCat(this, uin)
+            refreshTokenAsync()
+        }
+    }
+
+    private fun confirmStopNapcat() {
+        if (!BridgeService.isRunning) {
+            stopNapcat()
+            return
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.dlg_stop_napcat_title)
+            .setMessage(R.string.dlg_stop_napcat_msg)
+            .setPositiveButton(R.string.act_stop) { _, _ -> stopNapcat() }
+            .setNegativeButton(R.string.dlg_cancel, null)
+            .show()
+    }
+
+    private fun stopNapcat() {
+        rowNapcat.action.isEnabled = false
+        clearQr()
+        io.execute { SetupOrchestrator.stopAll(this) }
+    }
+
+    private fun startBridge() {
+        val cfg = currentConfig()
+        val missing = cfg.missingRequired()
+        if (missing.isNotEmpty()) {
+            toast(getString(R.string.toast_need_config, missing.joinToString("、")))
+            selectTab(1)
+            validateForm()
+            return
+        }
+        saveQuietly()
+        BridgeService.start(this)
+        renderState()
+    }
+
+    private fun stopBridge() {
+        BridgeService.stop(this)
+        renderState()
+    }
+
+    private fun color(resId: Int) = ContextCompat.getColor(this, resId)
+
+    private fun setRow(
+        row: ItemStatusRowBinding,
+        status: String,
+        dot: Int,
+        busy: Boolean,
+        actionText: Int?,
+        actionEnabled: Boolean = true,
+        primary: Boolean = false,
+    ) {
+        row.status.text = status
+        row.dot.backgroundTintList = ColorStateList.valueOf(color(dot))
+        row.progress.visibility = if (busy) View.VISIBLE else View.GONE
+        if (actionText == null) {
+            row.action.visibility = View.GONE
+        } else {
+            row.action.visibility = View.VISIBLE
+            row.action.setText(actionText)
+            row.action.isEnabled = actionEnabled && !busy
+            // 下一步要做的操作用实心按钮突出，其余用描边按钮
+            val bg = if (primary) resolveAttr(com.google.android.material.R.attr.colorPrimary) else android.graphics.Color.TRANSPARENT
+            val fg = if (primary) resolveAttr(com.google.android.material.R.attr.colorOnPrimary) else resolveAttr(com.google.android.material.R.attr.colorPrimary)
+            row.action.backgroundTintList = ColorStateList.valueOf(bg)
+            row.action.setTextColor(fg)
+            row.action.strokeWidth = if (primary) 0 else dp(1)
+            row.action.strokeColor = ColorStateList.valueOf(color(R.color.app_outline))
+        }
+    }
+
+    private fun resolveAttr(attr: Int): Int {
+        val tv = TypedValue()
+        theme.resolveAttribute(attr, tv, true)
+        return tv.data
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun renderState() {
+        if (isFinishing || isDestroyed) return
+        val s = NapCatManager.state
+        val envReady = s !in setOf(NapCatState.NEED_BOOTSTRAP, NapCatState.NEED_INSTALL, NapCatState.INSTALLING, NapCatState.ERROR)
+        val bridgeOn = BridgeService.isRunning
+        val missing = currentConfig().missingRequired()
+
+        // 环境
+        when (s) {
+            NapCatState.NEED_BOOTSTRAP -> setRow(rowEnv, getString(R.string.st_env_missing), R.color.dot_gray, false, R.string.act_init, primary = true)
+            NapCatState.NEED_INSTALL -> setRow(rowEnv, getString(R.string.st_env_partial), R.color.dot_amber, false, R.string.act_init, primary = true)
+            NapCatState.INSTALLING -> setRow(rowEnv, getString(R.string.st_env_installing), R.color.dot_amber, true, null)
+            NapCatState.ERROR -> setRow(rowEnv, getString(R.string.st_env_error), R.color.dot_red, false, R.string.act_retry, primary = true)
+            else -> setRow(rowEnv, getString(R.string.st_env_ready), R.color.dot_green, false, null)
+        }
+
+        // QQ
+        when {
+            !envReady -> setRow(rowNapcat, getString(R.string.st_napcat_unavailable), R.color.dot_gray, false, R.string.act_start, actionEnabled = false)
+            s == NapCatState.STARTING -> setRow(rowNapcat, getString(R.string.st_napcat_starting), R.color.dot_amber, true, null)
+            s == NapCatState.STOPPING -> setRow(rowNapcat, getString(R.string.st_napcat_stopping), R.color.dot_amber, true, null)
+            s == NapCatState.WAIT_LOGIN -> setRow(rowNapcat, getString(R.string.st_napcat_login), R.color.dot_amber, false, R.string.act_stop)
+            s == NapCatState.RUNNING -> setRow(rowNapcat, getString(R.string.st_napcat_running), R.color.dot_green, false, R.string.act_stop)
+            else -> setRow(rowNapcat, getString(R.string.st_napcat_off), R.color.dot_gray, false, R.string.act_start, primary = true)
+        }
+
+        // 桥接
+        if (bridgeOn) {
+            val label = BridgeService.connectionLabel ?: getString(R.string.st_napcat_starting)
+            val connected = label.startsWith("QQ") || label.startsWith("已连接")
+            setRow(rowBridge, getString(R.string.st_bridge_on, label), if (connected) R.color.dot_green else R.color.dot_amber, false, R.string.act_stop)
+        } else {
+            val canStart = isNapcatActive(s)
+            setRow(rowBridge, getString(R.string.st_bridge_off), R.color.dot_gray, false, R.string.act_start, primary = canStart)
+        }
+
+        // 登录卡片：QQ 运行期间显示
+        binding.cardLogin.visibility = if (isNapcatActive(s)) View.VISIBLE else View.GONE
+
+        renderHint(s, envReady, bridgeOn, missing)
+    }
+
+    private fun renderHint(s: NapCatState, envReady: Boolean, bridgeOn: Boolean, missing: List<String>) {
+        val (title, body, action) = when {
+            s == NapCatState.ERROR -> Triple(R.string.hint_error_title, getString(R.string.hint_error_body), null)
+            s == NapCatState.INSTALLING -> Triple(R.string.hint_installing_title, getString(R.string.hint_installing_body), null)
+            missing.isNotEmpty() -> Triple(
+                R.string.hint_config_title,
+                getString(R.string.hint_config_body, missing.joinToString("、")),
+                R.string.hint_config_action,
+            )
+            !envReady -> Triple(R.string.hint_init_title, getString(R.string.hint_init_body), null)
+            s == NapCatState.STARTING -> Triple(R.string.hint_starting_title, getString(R.string.hint_starting_body), null)
+            !isNapcatActive(s) -> Triple(R.string.hint_napcat_title, getString(R.string.hint_napcat_body), null)
+            !bridgeOn && s == NapCatState.WAIT_LOGIN -> Triple(R.string.hint_login_title, getString(R.string.hint_login_body), null)
+            !bridgeOn -> Triple(R.string.hint_bridge_title, getString(R.string.hint_bridge_body), null)
+            else -> Triple(R.string.hint_ready_title, getString(R.string.hint_ready_body), null)
+        }
+        binding.tvHintTitle.setText(title)
+        binding.tvHintBody.text = body
+        if (action != null) {
+            binding.btnHintAction.visibility = View.VISIBLE
+            binding.btnHintAction.setText(action)
+            binding.btnHintAction.setOnClickListener {
+                selectTab(1)
+                validateForm()
+            }
+        } else {
+            binding.btnHintAction.visibility = View.GONE
+        }
+    }
+
+    // ---------- 登录卡片 ----------
+
+    private fun setupLoginCard() {
+        binding.btnWebUi.setOnClickListener {
+            startActivity(Intent(this, WebLoginActivity::class.java).putExtra("url", NapCatManager.webUiUrl(this)))
+        }
+        binding.btnCopyToken.setOnClickListener {
+            val t = webUiToken
+            if (t.isNullOrBlank()) {
+                toast(getString(R.string.toast_token_missing))
+                refreshTokenAsync()
+            } else {
+                copy("NapCat WebUI Token", t)
+                toast(getString(R.string.toast_token_copied))
+            }
+        }
+    }
+
+    /** Token 要扫日志文件，放到后台线程。 */
+    private fun refreshTokenAsync() {
+        if (webUiToken != null) return
+        Thread {
+            val t = NapCatManager.resolveWebUiToken(this)
+            if (t != null) webUiToken = t
+        }.start()
+    }
+
+    private fun clearQr() {
+        binding.imgQr.visibility = View.GONE
+        binding.tvQr.visibility = View.GONE
+    }
+
+    /** 字符画二维码：按行宽算字号，保证一行不换行且整体放得进卡片。 */
+    private fun showQrBlock(block: List<String>) {
+        selectTab(0)
+        binding.cardLogin.visibility = View.VISIBLE
+        binding.imgQr.visibility = View.GONE
+        val cols = block.maxOf { it.length }.coerceAtLeast(1)
+        // 首页刚从 GONE 切回时还没测量，用根视图宽度
+        val available = binding.root.width - dp(80)
+        val paint = Paint().apply { typeface = Typeface.MONOSPACE; textSize = 100f }
+        val charW = paint.measureText("█") / 100f
+        val px = (available / (cols * charW)).coerceIn(2f, 24f)
+        binding.tvQr.setTextSize(TypedValue.COMPLEX_UNIT_PX, px)
+        binding.tvQr.setHorizontallyScrolling(true)
+        binding.tvQr.text = block.joinToString("\n")
+        binding.tvQr.visibility = View.VISIBLE
+        binding.panelHome.post { binding.panelHome.smoothScrollTo(0, binding.cardLogin.top) }
+    }
+
+    private fun showQrImage(f: File) {
+        val bmp: Bitmap = BitmapFactory.decodeFile(f.absolutePath) ?: return
+        selectTab(0)
+        binding.cardLogin.visibility = View.VISIBLE
+        binding.tvQr.visibility = View.GONE
+        binding.imgQr.setImageBitmap(bmp)
+        binding.imgQr.visibility = View.VISIBLE
+        binding.panelHome.post { binding.panelHome.smoothScrollTo(0, binding.cardLogin.top) }
     }
 
     private fun startLogPump() {
@@ -166,212 +433,253 @@ class MainActivity : AppCompatActivity() {
         logPump?.stop()
         logPump = LogPump(
             file = logFile,
-            onLine = {},
-            onQrBlock = { block ->
-                mainHandler.post {
-                    showLogTab()
-                    showQrBlock(block)
+            onLine = { line ->
+                if (webUiToken == null) {
+                    NapCatManager.noteWebUiToken(line)
+                    NapCatManager.webUiToken?.let { webUiToken = it }
                 }
             },
-            onImage = { f ->
-                mainHandler.post {
-                    showLogTab()
-                    appendLog("【二维码图片】${f.absolutePath}")
-                    try {
-                        binding.imgQr.setImageURI(Uri.fromFile(f))
-                        binding.imgQr.visibility = View.VISIBLE
-                    } catch (_: Exception) {
-                    }
-                }
-            },
+            onQrBlock = { block -> mainHandler.post { showQrBlock(block) } },
+            onImage = { f -> mainHandler.post { showQrImage(f) } },
         ).also { it.start() }
     }
 
-    private fun appendLog(line: String) {
-        NapCatManager.noteWebUiToken(line)
-        refreshWebUiTokenUi()
-        binding.tvLog.append(line + "\n")
-        binding.scroll.post {
-            binding.scroll.fullScroll(ScrollView.FOCUS_DOWN)
-        }
-    }
+    // ---------- 设置 ----------
 
-    private fun appendLogSafe(line: String) {
-        mainHandler.post { appendLog(line) }
-    }
-
-    private fun refreshWebUiTokenUi() {
-        val t = NapCatManager.webUiToken ?: NapCatManager.resolveWebUiToken(this)
-        val text = if (t.isNullOrBlank()) {
-            "启动 NapCat 后显示"
-        } else {
-            "$t\nhttp://127.0.0.1:6099/webui?token=$t"
+    private fun setupSettings() {
+        binding.ddPlatform.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, listOf("napcat", "onebot")))
+        binding.btnAdvanced.setOnClickListener {
+            val show = binding.groupAdvanced.visibility != View.VISIBLE
+            binding.groupAdvanced.visibility = if (show) View.VISIBLE else View.GONE
+            binding.btnAdvanced.setText(if (show) R.string.advanced_hide else R.string.advanced_show)
         }
-        if (binding.tvWebUiToken.text.toString() != text) {
-            binding.tvWebUiToken.text = text
-        }
-    }
-
-    private fun showQrBlock(block: List<String>) {
-        appendLog("======== QQ 登录二维码 ========")
-        val ssb = SpannableStringBuilder()
-        block.forEachIndexed { i, l ->
-            ssb.append(l)
-            if (i < block.size - 1) ssb.append("\n")
-        }
-        // 放大便于扫码
-        ssb.setSpan(AbsoluteSizeSpan(48, true), 0, ssb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        binding.tvLog.append(ssb)
-        binding.tvLog.append("\n请用手机 QQ 扫码或进入WebUI")
-        binding.tvLog.typeface = Typeface.MONOSPACE
-        binding.scroll.post {
-            binding.scroll.fullScroll(ScrollView.FOCUS_DOWN)
-        }
-    }
-
-    private fun dotColor(resId: Int) = ColorStateList.valueOf(ContextCompat.getColor(this, resId))
-
-    private fun renderState(s: NapCatState) {
-        val (envText, envColor) = when (s) {
-            NapCatState.NEED_BOOTSTRAP -> "环境：未安装（需初始化）" to R.color.dot_gray
-            NapCatState.NEED_INSTALL -> "环境：待装 NapCat" to R.color.dot_amber
-            NapCatState.INSTALLING -> "环境：安装中…" to R.color.dot_amber
-            NapCatState.READY -> "环境：就绪" to R.color.dot_green
-            NapCatState.STARTING -> "NapCat：启动中…" to R.color.dot_amber
-            NapCatState.RUNNING -> "NapCat：已启动" to R.color.dot_green
-            NapCatState.WAIT_LOGIN -> "NapCat：已启动（待登录）" to R.color.dot_green
-            NapCatState.STOPPING -> "NapCat：停止中…" to R.color.dot_amber
-            NapCatState.ERROR -> "环境：出错（可重试初始化）" to R.color.dot_red
-        }
-        binding.tvStatus.text = envText
-        binding.dotEnv.backgroundTintList = dotColor(envColor)
-        val bridgeRunning = BridgeService.isRunning
-        binding.tvBridge.text = if (bridgeRunning) "桥接：运行中" else "桥接：已停止"
-        binding.dotBridge.backgroundTintList =
-            dotColor(if (bridgeRunning) R.color.dot_green else R.color.dot_gray)
-        binding.btnStartBridge.isEnabled = !bridgeRunning
-        binding.btnStopBridge.isEnabled = bridgeRunning
-        binding.btnInit.isEnabled = s == NapCatState.NEED_BOOTSTRAP || s == NapCatState.NEED_INSTALL || s == NapCatState.ERROR
-        binding.btnStartNapcat.isEnabled = s == NapCatState.READY || s == NapCatState.WAIT_LOGIN || s == NapCatState.ERROR || s == NapCatState.NEED_INSTALL
-        binding.btnStopNapcat.isEnabled = s == NapCatState.RUNNING || s == NapCatState.STARTING || s == NapCatState.WAIT_LOGIN
+        binding.btnSaveConfig.setOnClickListener { saveFromButton() }
+        // 修改后清除该项的错误提示
+        listOf(
+            binding.tilMisskeyHost, binding.tilCharacterId, binding.tilStyleId,
+            binding.tilAllowedQq, binding.tilAllowedGroups, binding.tilAdminQq,
+            binding.tilPrefix, binding.tilNapcatWs,
+        ).forEach { til -> til.editText?.doAfterTextChanged { til.error = null } }
     }
 
     private fun loadConfigIntoUi() {
-        val file = BridgeService.configFile(this)
-        val cfg = ConfigLoader.load(file, BridgeService.defaultDataDir(this))
-        binding.etPlatform.setText(cfg.platform.adapter)
-        binding.etNapcatWs.setText(cfg.napcat.wsUrl)
-        binding.etNapcatToken.setText(cfg.napcat.accessToken)
+        val cfg = loadSavedConfig()
         binding.etMisskeyHost.setText(cfg.misskey.host)
         binding.etCharacterId.setText(cfg.misskey.characterId)
         binding.etStyleId.setText(cfg.misskey.dialogueStyleId)
+        binding.etAllowedQq.setText(cfg.allowedQq.joinToString(", "))
+        binding.etAllowedGroups.setText(cfg.allowedGroups.joinToString(", "))
+        binding.etAdminQq.setText(cfg.adminQq.joinToString(", "))
         binding.etPrefix.setText(cfg.commandPrefix)
-        binding.etAllowedQq.setText(cfg.allowedQq.joinToString(","))
-        binding.etAllowedGroups.setText(cfg.allowedGroups.joinToString(","))
-        binding.etAdminQq.setText(cfg.adminQq.joinToString(","))
+        binding.ddPlatform.setText(cfg.platform.adapter, false)
+        binding.etNapcatWs.setText(cfg.napcat.wsUrl)
+        binding.etNapcatToken.setText(cfg.napcat.accessToken)
         val uinFile = NapCatManager.qqUinFile(this)
         binding.etQqUin.setText(if (uinFile.exists()) uinFile.readText().trim() else "")
     }
 
-    private fun collectConfig(): BridgeConfig {
-        val file = BridgeService.configFile(this)
-        val base = ConfigLoader.load(file, BridgeService.defaultDataDir(this))
-        fun csv(s: String): List<String> =
-            s.split(",", "，", " ").map { it.trim() }.filter { it.isNotEmpty() }
+    /** 已保存配置的缓存：renderState 频繁调用，避免每次都读盘解析。写入后刷新。 */
+    private var savedConfig: BridgeConfig? = null
+
+    private fun loadSavedConfig(): BridgeConfig =
+        savedConfig ?: ConfigLoader.load(BridgeService.configFile(this), BridgeService.defaultDataDir(this))
+            .also { savedConfig = it }
+
+    private fun csv(s: String): List<String> =
+        s.split(",", "，", " ").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+
+    /** 表单当前内容合成的配置（未校验）。 */
+    private fun currentConfig(): BridgeConfig {
+        val base = loadSavedConfig()
+        val (scheme, host) = normalizeHost(binding.etMisskeyHost.text.toString(), base.misskey.scheme)
         return base.copy(
-            platform = base.platform.copy(adapter = binding.etPlatform.text.toString().trim().ifBlank { "napcat" }),
+            platform = base.platform.copy(adapter = binding.ddPlatform.text.toString().trim().ifBlank { "napcat" }),
             napcat = base.napcat.copy(
                 wsUrl = binding.etNapcatWs.text.toString().trim().ifBlank { base.napcat.wsUrl },
-                accessToken = binding.etNapcatToken.text.toString(),
+                accessToken = binding.etNapcatToken.text.toString().trim(),
             ),
             misskey = base.misskey.copy(
-                host = binding.etMisskeyHost.text.toString().trim().ifBlank { base.misskey.host },
-                characterId = binding.etCharacterId.text.toString().trim().ifBlank { base.misskey.characterId },
-                dialogueStyleId = binding.etStyleId.text.toString().trim().ifBlank { base.misskey.dialogueStyleId },
+                host = host,
+                scheme = scheme,
+                characterId = binding.etCharacterId.text.toString().trim(),
+                dialogueStyleId = binding.etStyleId.text.toString().trim(),
             ),
-            commandPrefix = binding.etPrefix.text.toString().ifBlank { "/" },
+            commandPrefix = binding.etPrefix.text.toString().trim().ifBlank { "/" },
             allowedQq = csv(binding.etAllowedQq.text.toString()),
             allowedGroups = csv(binding.etAllowedGroups.text.toString()),
             adminQq = csv(binding.etAdminQq.text.toString()),
             dataDir = base.dataDir.ifBlank { BridgeService.defaultDataDir(this) },
-            logFile = base.logFile,
         )
     }
 
+    /** 逐项校验，错误显示在对应输入框下方；返回是否全部通过。 */
+    private fun validateForm(): Boolean {
+        var ok = true
+        fun check(til: TextInputLayout, error: String?) {
+            til.error = error
+            if (error != null) ok = false
+        }
+        val hostRaw = binding.etMisskeyHost.text.toString().trim()
+        val host = normalizeHost(hostRaw).second
+        check(
+            binding.tilMisskeyHost,
+            when {
+                hostRaw.isEmpty() -> getString(R.string.err_required)
+                !Regex("^[A-Za-z0-9.-]+(:\\d{1,5})?$").matches(host) || !host.contains('.') && !host.startsWith("localhost") ->
+                    getString(R.string.err_host)
+                else -> null
+            },
+        )
+        check(binding.tilCharacterId, if (binding.etCharacterId.text.isNullOrBlank()) getString(R.string.err_required) else null)
+        check(binding.tilStyleId, if (binding.etStyleId.text.isNullOrBlank()) getString(R.string.err_required) else null)
+        for (til in listOf(binding.tilAllowedQq, binding.tilAllowedGroups, binding.tilAdminQq)) {
+            val bad = csv(til.editText?.text.toString()).any { !it.all(Char::isDigit) }
+            check(til, if (bad) getString(R.string.err_numbers) else null)
+        }
+        val prefix = binding.etPrefix.text.toString()
+        check(binding.tilPrefix, if (prefix.isBlank() || prefix.trim().contains(' ')) getString(R.string.err_prefix) else null)
+        val ws = binding.etNapcatWs.text.toString().trim()
+        val wsBad = ws.isNotEmpty() && !ws.startsWith("ws://") && !ws.startsWith("wss://")
+        check(binding.tilNapcatWs, if (wsBad) getString(R.string.err_ws) else null)
+        if (wsBad) {
+            binding.groupAdvanced.visibility = View.VISIBLE
+            binding.btnAdvanced.setText(R.string.advanced_hide)
+        }
+        return ok
+    }
+
     private fun writeSettings() {
-        ConfigLoader.save(BridgeService.configFile(this), collectConfig())
+        val cfg = currentConfig()
+        ConfigLoader.save(BridgeService.configFile(this), cfg)
+        savedConfig = cfg
         NapCatManager.qqUinFile(this).writeText(binding.etQqUin.text.toString().trim())
     }
 
+    /** 启动类操作前顺手保存：仅在必填项齐全时写入，避免把半成品写进配置。 */
     private fun saveQuietly() {
         try {
-            writeSettings()
-        } catch (_: Exception) {
+            if (currentConfig().missingRequired().isEmpty()) writeSettings()
+            else NapCatManager.qqUinFile(this).writeText(binding.etQqUin.text.toString().trim())
+        } catch (e: Exception) {
+            BridgeLog.w("保存设置失败: $e")
         }
     }
 
-    private fun bindButtons() {
-        binding.btnInit.setOnClickListener {
-            saveQuietly()
-            Toast.makeText(this, "开始初始化环境…", Toast.LENGTH_SHORT).show()
-            io.execute {
-                SetupOrchestrator.initialize(this) { msg ->
-                    mainHandler.post { appendLog("» $msg") }
-                }
+    private fun saveFromButton() {
+        if (!validateForm()) {
+            toast(getString(R.string.toast_fix_fields))
+            return
+        }
+        try {
+            writeSettings()
+        } catch (e: Exception) {
+            toast("保存失败：${e.message}")
+            return
+        }
+        // 规范化后的地址回显，让用户看到实际生效的值
+        binding.etMisskeyHost.setText(currentConfig().misskey.host)
+        toast(getString(R.string.toast_saved))
+        renderState()
+        if (BridgeService.isRunning) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.dlg_restart_title)
+                .setMessage(R.string.dlg_restart_msg)
+                .setPositiveButton(R.string.dlg_restart_ok) { _, _ -> restartBridge() }
+                .setNegativeButton(R.string.dlg_later, null)
+                .show()
+        } else {
+            selectTab(0)
+        }
+    }
+
+    private fun restartBridge() {
+        BridgeService.stop(this)
+        // 等服务 onDestroy 完成后再拉起，避免新实例被旧的 stop 带走
+        mainHandler.postDelayed({ BridgeService.start(this) }, 800)
+        selectTab(0)
+    }
+
+    // ---------- 日志 ----------
+
+    private fun setupLogPanel() {
+        binding.chipsLog.setOnCheckedStateChangeListener { _, ids ->
+            logFilter = when (ids.firstOrNull()) {
+                R.id.chipBridge -> LogFilter.BRIDGE
+                R.id.chipError -> LogFilter.ERROR
+                else -> LogFilter.ALL
             }
-        }
-        binding.btnStartNapcat.setOnClickListener {
-            saveQuietly()
-            io.execute {
-                SetupOrchestrator.startNapCat(this, binding.etQqUin.text.toString().trim())
-            }
-        }
-        binding.btnStopNapcat.setOnClickListener {
-            io.execute { SetupOrchestrator.stopAll(this) }
-        }
-        binding.btnStartBridge.setOnClickListener {
-            saveQuietly()
-            BridgeService.start(this)
-            mainHandler.postDelayed({ NapCatManager.refreshState(this) }, 500)
-        }
-        binding.btnStopBridge.setOnClickListener {
-            BridgeService.stop(this)
-            mainHandler.postDelayed({ NapCatManager.refreshState(this) }, 300)
-        }
-        binding.btnSaveConfig.setOnClickListener {
-            try {
-                writeSettings()
-                Toast.makeText(this, "设置已保存", Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                Toast.makeText(this, "保存失败: $e", Toast.LENGTH_LONG).show()
-            }
+            followLog = true
+            refreshLog()
         }
         binding.btnClearLog.setOnClickListener {
             BridgeLog.clearBuffer()
-            binding.tvLog.text = ""
+            refreshLog()
         }
-        binding.btnWebUi.setOnClickListener {
-            val url = NapCatManager.webUiUrl(this)
-            Log.i("bridge", "open WebUI $url")
-            startActivity(
-                Intent(this, WebLoginActivity::class.java)
-                    .putExtra("url", url),
-            )
+        binding.btnCopyLog.setOnClickListener {
+            copy("QBridge 日志", filteredLines().joinToString("\n"))
+            toast(getString(R.string.toast_log_copied))
         }
-        binding.btnCopyToken.setOnClickListener {
-            val t = NapCatManager.webUiToken ?: NapCatManager.resolveWebUiToken(this)
-            if (t.isNullOrBlank()) {
-                Toast.makeText(this, "Token 尚未生成，请先启动 NapCat", Toast.LENGTH_SHORT).show()
-            } else {
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("NapCat WebUI Token", t))
-                Toast.makeText(this, "已复制 Token：$t", Toast.LENGTH_SHORT).show()
-            }
+        binding.btnScrollEnd.setOnClickListener {
+            followLog = true
+            binding.btnScrollEnd.visibility = View.GONE
+            binding.scroll.post { binding.scroll.fullScroll(View.FOCUS_DOWN) }
         }
-        refreshWebUiTokenUi()
-        // 启动后轮询几次，直到拿到 token
-        mainHandler.postDelayed({ refreshWebUiTokenUi() }, 3000)
-        mainHandler.postDelayed({ refreshWebUiTokenUi() }, 8000)
-        mainHandler.postDelayed({ refreshWebUiTokenUi() }, 15000)
+        // 用户向上翻看时暂停自动滚动
+        binding.scroll.setOnScrollChangeListener { v, _, scrollY, _, _ ->
+            val child = (v as android.widget.ScrollView).getChildAt(0) ?: return@setOnScrollChangeListener
+            val atBottom = scrollY + v.height >= child.height - dp(24)
+            followLog = atBottom
+            binding.btnScrollEnd.visibility = if (atBottom) View.GONE else View.VISIBLE
+        }
     }
+
+    /** 日志可能一秒几十行，合并成每 300ms 最多刷新一次。 */
+    private fun scheduleLogRefresh() {
+        if (!pendingLogRefresh.compareAndSet(false, true)) return
+        mainHandler.postDelayed({
+            pendingLogRefresh.set(false)
+            if (binding.panelLog.visibility == View.VISIBLE) refreshLog()
+        }, 300)
+    }
+
+    private fun filteredLines(): List<String> {
+        val all = BridgeLog.buffer.toList()
+        return when (logFilter) {
+            LogFilter.ALL -> all
+            LogFilter.BRIDGE -> all.filter { "[bridge]" in it && "[napcat]" !in it }
+            LogFilter.ERROR -> all.filter { " W [" in it || " E [" in it }
+        }
+    }
+
+    private fun refreshLog() {
+        val lines = filteredLines().takeLast(logViewLimit)
+        if (lines.isEmpty()) {
+            binding.tvLog.text = getString(R.string.log_empty)
+            return
+        }
+        val warn = color(R.color.dot_amber)
+        val err = color(R.color.dot_red)
+        val ssb = SpannableStringBuilder()
+        for (line in lines) {
+            val start = ssb.length
+            ssb.append(line).append('\n')
+            val c = when {
+                " E [" in line -> err
+                " W [" in line -> warn
+                else -> null
+            }
+            if (c != null) ssb.setSpan(ForegroundColorSpan(c), start, ssb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        binding.tvLog.text = ssb
+        if (followLog) binding.scroll.post { binding.scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    // ---------- 工具 ----------
+
+    private fun copy(label: String, text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText(label, text))
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 }

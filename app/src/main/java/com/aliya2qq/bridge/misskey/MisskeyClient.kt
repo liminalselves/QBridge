@@ -20,27 +20,68 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.security.MessageDigest
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
-open class MisskeyAPIError(val status: Int, val code: String = "", message: String = "") :
-    Exception("Misskey API 错误 $status: $code $message")
+open class MisskeyAPIError(val status: Int, val code: String = "", val apiMessage: String = "") :
+    Exception("Misskey API 错误 $status: $code $apiMessage") {
+    /** 面向 QQ 用户的中文说明。 */
+    open fun friendly(): String = friendlyError(code, status, apiMessage)
+}
 
 open class RateLimitError(val retryAfter: Double) :
-    MisskeyAPIError(429, "RATE_LIMIT_EXCEEDED", "请 ${retryAfter.toInt()}s 后重试")
+    MisskeyAPIError(429, "RATE_LIMIT_EXCEEDED", "请 ${retryAfter.toInt()}s 后重试") {
+    override fun friendly() = "Misskey 限流中，请约 ${maxOf(1, retryAfter.toInt())} 秒后再试。"
+}
 
 open class BannedError(code: String) : MisskeyAPIError(403, code, "会话/角色被封禁")
+
+/** Token 失效或权限不足：需要重新绑定。 */
+class AuthError(status: Int, code: String) : MisskeyAPIError(status, code, "")
+
+private val AUTH_CODES = setOf("AUTHENTICATION_FAILED", "CREDENTIAL_REQUIRED", "YOUR_ACCOUNT_SUSPENDED")
+
+/** 常见错误码的中文说明；未收录的给出原始码便于排查。 */
+fun friendlyError(code: String, status: Int, message: String = ""): String = when (code) {
+    "AUTHENTICATION_FAILED", "CREDENTIAL_REQUIRED" -> "Misskey Token 已失效，请重新 /bind 绑定。"
+    "YOUR_ACCOUNT_SUSPENDED" -> "Misskey 账号已被冻结。"
+    "PERMISSION_DENIED" -> "Token 权限不足，请重新 /bind（MiAuth 会申请所需权限）。"
+    "ROLE_PERMISSION_DENIED" -> "当前账号角色无权使用该功能。"
+    "AGENT_SESSION_MODERATION_BANNED" -> "当前会话已被封禁，发送 /new 新建会话。"
+    "AGENT_CHARACTER_MODERATION_BANNED" -> "角色已被封禁，暂时无法对话。"
+    "AGENT_INSUFFICIENT_CREDIT", "AGENT_VISION_INSUFFICIENT_CREDIT" -> "Agent 余额不足，可 /checkin 签到或在网页端充值。"
+    "AGENT_IMAGE_INSUFFICIENT_CREDIT" -> "余额不足，无法生成图片。"
+    "AGENT_REPLY_PENDING" -> "上一条消息还在生成回复，请稍等（或发送 /stop 中止）。"
+    "AGENTS_LLM_ABORTED" -> "本次回复已中止。"
+    "AGENTS_LLM_TIMEOUT" -> "AI 回复超时，请稍后重试（/retry）。"
+    "AGENTS_LLM_FAILED" -> "AI 回复失败，请稍后重试（/retry）。"
+    "AGENTS_MODEL_UNAVAILABLE" -> "当前对话模型不可用，请 /model 换一个。"
+    "AGENTS_MODEL_NOT_CONFIGURED" -> "实例未配置对话模型。"
+    "AGENTS_DISABLED" -> "实例已关闭智能体功能。"
+    "AGENT_DIALOGUE_STYLE_REQUIRED", "STYLE_NOT_AVAILABLE", "STYLE_NOT_SUBSCRIBED", "STYLE_NOT_PUBLISHED" ->
+        "当前文风不可用，请 /style 重新选择。"
+    "NO_SUCH_SESSION" -> "会话不存在，发送 /new 新建。"
+    "NO_SUCH_CHARACTER", "AGENT_PUBLISHED_UNAVAILABLE" -> "角色不存在或已下架，请检查设置中的 character_id。"
+    "AGENT_MESSAGE_EMPTY" -> "消息内容为空。"
+    "MEMORY_NOT_AVAILABLE" -> "当前会话未开启长期记忆。"
+    "MEMORY_PROVIDER_ERROR" -> "长期记忆服务暂时不可用。"
+    "RATE_LIMIT_EXCEEDED" -> "Misskey 限流中，请稍后再试。"
+    else -> "Misskey 错误（$status${if (code.isNotBlank()) " $code" else ""}）" +
+        (if (message.isNotBlank()) "：${message.take(120)}" else "")
+}
 
 /** agents/messages/send 的返回结果。 */
 data class AgentSendResult(
     val ok: Boolean,
-    val delivered: Boolean,
     val replyText: String?,
     val replyMessageId: String?,
-    val error: String?,
+    val error: String? = null,
+    /** 无需向用户展示任何内容：已中止，或回复只有控制指令没有可见文本。 */
+    val silent: Boolean = false,
+    /** 本轮回复对主动消息计划做的操作（create / update / cancel）。 */
+    val scheduleActions: List<String> = emptyList(),
 )
 
 /**
@@ -55,12 +96,17 @@ class MisskeyClient(private val cfg: BridgeConfig) {
         .build()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
     private val rateLock = ConcurrentHashMap<String, Double>()
-    private val emojiCache = ConcurrentHashMap<String, String?>()
+
+    /** 表情名 → URL；null 表示实例没有这个表情。 */
+    private val emojiCache = ConcurrentHashMap<String, String>()
+    private val missingEmoji = ConcurrentHashMap.newKeySet<String>()
+
     @Volatile
     private var emojiListLoaded = false
 
     fun close() {
-        // 连接池由 OkHttp 自行管理，无需显式释放
+        client.dispatcher.executorService.shutdown()
+        client.connectionPool.evictAll()
     }
 
     // ---------- 底层请求 ----------
@@ -78,7 +124,12 @@ class MisskeyClient(private val cfg: BridgeConfig) {
         }
     }
 
-    private fun postJson(url: String, body: JSONObject, timeoutSec: Double, extraHeaders: Map<String, String> = emptyMap()): Response {
+    private fun lockRate(token: String) {
+        rateLock[tokenFp(token)] = System.currentTimeMillis() / 1000.0 + cfg.misskey.rateLimitLock
+        BridgeLog.w("Misskey 429 限流，token 锁定 ${cfg.misskey.rateLimitLock} 秒")
+    }
+
+    private fun postJson(url: String, body: JSONObject, timeoutSec: Double, extraHeaders: Map<String, String>): Response {
         val headers = okhttp3.Headers.Builder()
             .add("Origin", base)
             .add("User-Agent", UA)
@@ -96,7 +147,18 @@ class MisskeyClient(private val cfg: BridgeConfig) {
             .execute()
     }
 
-    private suspend fun post(
+    private fun parseBody(text: String?): Any? = try {
+        val t = text?.trimStart() ?: ""
+        when {
+            t.startsWith("[") -> JSONArray(t)
+            t.startsWith("{") -> JSONObject(t)
+            else -> null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun post(
         endpoint: String,
         payload: JSONObject,
         timeout: Double,
@@ -108,36 +170,17 @@ class MisskeyClient(private val cfg: BridgeConfig) {
             checkRateLock(token)
             body.put("i", token)
         }
-        val keys = payload.keys()
-        while (keys.hasNext()) {
-            val k = keys.next()
-            body.put(k, payload.get(k))
-        }
-        val url = "$base/api/$endpoint"
+        payload.keys().forEach { k -> body.put(k, payload.get(k)) }
         try {
-            postJson(url, body, timeout, extraHeaders).use { resp ->
+            postJson("$base/api/$endpoint", body, timeout, extraHeaders).use { resp ->
                 if (resp.code == 204) return 204 to null
-                val text = resp.body?.string()
-                val data: Any? = try {
-                    when {
-                        text.isNullOrBlank() -> null
-                        text.trimStart().startsWith("[") -> JSONArray(text)
-                        text.trimStart().startsWith("{") -> JSONObject(text)
-                        else -> null
-                    }
-                } catch (_: Exception) {
-                    null
-                }
-                if (resp.code == 429) {
-                    rateLock[tokenFp(token ?: "")] =
-                        System.currentTimeMillis() / 1000.0 + cfg.misskey.rateLimitLock
-                    BridgeLog.w("Misskey 429 限流，token 锁定 ${cfg.misskey.rateLimitLock} 秒")
-                }
+                val data = parseBody(resp.body?.string())
+                if (resp.code == 429 && token != null) lockRate(token)
                 return resp.code to data
             }
         } catch (e: IOException) {
-            if (e.message?.contains("timeout", true) == true || e is java.net.SocketTimeoutException) {
-                throw TimeoutException("Misskey $endpoint 请求超时(${timeout}s)")
+            if (e is java.io.InterruptedIOException || e.message?.contains("timeout", true) == true) {
+                throw TimeoutException("Misskey $endpoint 请求超时(${timeout.toInt()}s)")
             }
             throw e
         }
@@ -146,49 +189,62 @@ class MisskeyClient(private val cfg: BridgeConfig) {
     private fun raiseFromError(status: Int, data: Any?): Nothing {
         val err = (data as? JSONObject)?.optJSONObject("error") ?: JSONObject()
         val code = err.optString("code", "")
-        if (code in listOf(
-                "AGENT_SESSION_MODERATION_BANNED",
-                "AGENT_CHARACTER_MODERATION_BANNED",
-            )
-        ) {
-            throw BannedError(code)
+        when {
+            status == 429 -> throw RateLimitError(cfg.misskey.rateLimitLock)
+            code in AUTH_CODES || (status == 401 && code.isBlank()) -> throw AuthError(status, code)
+            code == "AGENT_SESSION_MODERATION_BANNED" || code == "AGENT_CHARACTER_MODERATION_BANNED" ->
+                throw BannedError(code)
         }
         throw MisskeyAPIError(status, code, err.optString("message", ""))
     }
 
-    private fun jsonArrayToList(arr: JSONArray): List<JSONObject> {
-        val out = ArrayList<JSONObject>(arr.length())
-        for (i in 0 until arr.length()) {
-            arr.optJSONObject(i)?.let { out.add(it) }
-        }
-        return out
+    private fun requireOk(status: Int, data: Any?, vararg ok: Int = intArrayOf(200)) {
+        if (status !in ok) raiseFromError(status, data)
+    }
+
+    private fun jsonArrayToList(arr: JSONArray): List<JSONObject> =
+        (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+
+    private fun call(endpoint: String, token: String, payload: JSONObject = JSONObject()): Any? {
+        val (status, data) = post(endpoint, payload, cfg.misskey.timeoutNormal, token = token)
+        requireOk(status, data, 200, 201, 204)
+        return data
+    }
+
+    private fun callObject(endpoint: String, token: String, payload: JSONObject = JSONObject()): JSONObject =
+        call(endpoint, token, payload) as? JSONObject ?: JSONObject()
+
+    private fun callList(endpoint: String, token: String, payload: JSONObject = JSONObject()): List<JSONObject> {
+        val (status, data) = post(endpoint, payload, cfg.misskey.timeoutNormal, token = token)
+        if (status != 200 || data !is JSONArray) raiseFromError(status, data)
+        return jsonArrayToList(data)
     }
 
     // ---------- 鉴权 ----------
 
-    suspend fun validateToken(token: String): JSONObject? {
+    /** 校验 token：有效返回用户对象；明确失效返回 null；网络错误抛出。 */
+    fun validateToken(token: String): JSONObject? {
         val (status, data) = post("i", JSONObject(), 15.0, token = token)
-        return if (status == 200 && data is JSONObject) data else null
+        if (status == 200 && data is JSONObject) return data
+        if (status in listOf(401, 403)) return null
+        raiseFromError(status, data)
     }
 
-    suspend fun miauthCheck(sessionId: String): JSONObject? {
-        val url = "$base/api/miauth/$sessionId/check"
-        val req = Request.Builder().url(url).post("{}".toRequestBody(jsonMedia)).build()
+    fun miauthCheck(sessionId: String): JSONObject? {
+        val req = Request.Builder()
+            .url("$base/api/miauth/$sessionId/check")
+            .post("{}".toRequestBody(jsonMedia))
+            .build()
         client.newCall(req).execute().use { resp ->
             if (resp.code != 200) return null
-            val text = resp.body?.string() ?: return null
-            val data = try {
-                JSONObject(text)
-            } catch (_: Exception) {
-                return null
-            }
-            return if (data.optBoolean("ok") && data.has("token")) data else null
+            val data = parseBody(resp.body?.string()) as? JSONObject ?: return null
+            return if (data.optBoolean("ok") && data.optString("token").isNotBlank()) data else null
         }
     }
 
     // ---------- Drive ----------
 
-    suspend fun uploadDriveFile(token: String, data: ByteArray, filename: String, contentType: String): String? {
+    fun uploadDriveFile(token: String, data: ByteArray, filename: String, contentType: String): String? {
         checkRateLock(token)
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
@@ -201,326 +257,262 @@ class MisskeyClient(private val cfg: BridgeConfig) {
             .build()
             .newCall(req)
         call.execute().use { resp ->
-            if (resp.code == 429) {
-                rateLock[tokenFp(token)] =
-                    System.currentTimeMillis() / 1000.0 + cfg.misskey.rateLimitLock
-                throw RateLimitError(cfg.misskey.rateLimitLock)
-            }
-            if (resp.code != 200) {
-                throw MisskeyAPIError(resp.code, "DRIVE_UPLOAD_FAILED", (resp.body?.string() ?: "").take(200))
-            }
-            val text = resp.body?.string() ?: return null
-            return try {
-                JSONObject(text).optString("id").ifBlank { null }
-            } catch (_: Exception) {
-                null
-            }
+            val parsed = parseBody(resp.body?.string())
+            if (resp.code == 429) lockRate(token)
+            if (resp.code != 200) raiseFromError(resp.code, parsed)
+            return (parsed as? JSONObject)?.optString("id")?.ifBlank { null }
         }
     }
 
     // ---------- Agents 会话 ----------
 
-    suspend fun sessionsCreate(token: String, characterId: String, dialogueStyleId: String): String {
-        val (status, data) = post(
-            "agents/sessions/create",
+    fun sessionsCreate(token: String, characterId: String, dialogueStyleId: String): String {
+        val data = callObject(
+            "agents/sessions/create", token,
             JSONObject()
                 .put("characterId", characterId)
                 .put("dialogueStyleId", dialogueStyleId)
                 .put("sessionKind", "community"),
-            cfg.misskey.timeoutNormal,
-            token = token,
         )
-        if (status !in listOf(200, 201) || data !is JSONObject || data.optString("id").isBlank()) {
-            raiseFromError(status, data)
-        }
-        val sid = (data as JSONObject).getString("id")
-        // 新会话默认选列表里的第一个生图模型；取不到或失败都不影响建会话
+        val sid = data.optString("id")
+        if (sid.isBlank()) throw MisskeyAPIError(500, "SESSION_CREATE_FAILED", "返回中没有会话 id")
+        // 新会话的生图模型默认关闭，选列表里第一个启用画图；失败不影响建会话
         try {
             val modelId = imageModelsList(token).firstOrNull()?.optString("id")?.ifBlank { null }
-            if (modelId != null) {
-                sessionsUpdate(token, sid, JSONObject().put("agentImageModelId", modelId))
-            }
+            if (modelId != null) sessionsUpdate(token, sid, JSONObject().put("agentImageModelId", modelId))
         } catch (e: Exception) {
             BridgeLog.w("设置默认生图模型失败（忽略）: $e")
         }
         return sid
     }
 
-    suspend fun sessionsListMine(token: String): List<JSONObject> {
-        val (status, data) = post("agents/sessions/list-mine", JSONObject(), cfg.misskey.timeoutNormal, token = token)
-        if (status != 200 || data !is JSONArray) raiseFromError(status, data)
-        return jsonArrayToList(data)
-    }
+    fun sessionsListMine(token: String): List<JSONObject> =
+        callList("agents/sessions/list-mine", token, JSONObject().put("limit", 100))
 
-    suspend fun sessionsShow(token: String, sessionId: String): JSONObject {
-        val (status, data) = post(
-            "agents/sessions/show",
-            JSONObject().put("sessionId", sessionId),
-            cfg.misskey.timeoutNormal,
-            token = token,
-        )
-        if (status != 200 || data !is JSONObject) raiseFromError(status, data)
-        return data
-    }
+    fun sessionsShow(token: String, sessionId: String): JSONObject =
+        callObject("agents/sessions/show", token, JSONObject().put("sessionId", sessionId))
 
-    suspend fun sessionsUpdate(token: String, sessionId: String, fields: JSONObject): JSONObject {
+    fun sessionsUpdate(token: String, sessionId: String, fields: JSONObject): JSONObject {
         val payload = JSONObject().put("sessionId", sessionId)
         fields.keys().forEach { k -> payload.put(k, fields.get(k)) }
-        val (status, data) = post("agents/sessions/update", payload, cfg.misskey.timeoutNormal, token = token)
-        if (status !in listOf(200, 201)) raiseFromError(status, data)
-        return data as? JSONObject ?: JSONObject()
+        return callObject("agents/sessions/update", token, payload)
     }
 
-    suspend fun sessionsDelete(token: String, sessionId: String) {
-        val (status, data) = post(
-            "agents/sessions/delete",
-            JSONObject().put("sessionId", sessionId),
-            cfg.misskey.timeoutNormal,
-            token = token,
-        )
-        if (status !in listOf(200, 201, 204)) raiseFromError(status, data)
+    fun sessionsDelete(token: String, sessionId: String) {
+        call("agents/sessions/delete", token, JSONObject().put("sessionId", sessionId))
+    }
+
+    /** 标记会话已读：避免 Misskey 在 3 秒后再推送一遍 newAgentMessage / 手机推送。 */
+    fun sessionsRead(token: String, sessionId: String) {
+        try {
+            call("agents/sessions/read", token, JSONObject().put("sessionId", sessionId))
+        } catch (e: Exception) {
+            BridgeLog.d("标记已读失败（忽略）: $e")
+        }
     }
 
     // ---------- Agents 文风 ----------
 
-    suspend fun stylesListUsable(token: String): List<JSONObject> {
-        val (status, data) = post("agents/styles/list-usable", JSONObject(), cfg.misskey.timeoutNormal, token = token)
-        if (status != 200 || data !is JSONArray) raiseFromError(status, data)
-        return jsonArrayToList(data)
+    fun stylesListUsable(token: String): List<JSONObject> = callList("agents/styles/list-usable", token)
+
+    /** 已订阅时服务端同样返回成功。 */
+    fun stylesSubscribe(token: String, styleId: String) {
+        call("agents/styles/subscribe", token, JSONObject().put("styleId", styleId))
     }
 
-    suspend fun stylesSubscribe(token: String, styleId: String) {
-        val (status, data) = post(
-            "agents/styles/subscribe",
-            JSONObject().put("styleId", styleId),
-            cfg.misskey.timeoutNormal,
-            token = token,
-        )
-        val err = (data as? JSONObject)?.optJSONObject("error") ?: JSONObject()
-        if (err.optString("code") == "NO_SUCH_STYLE") return
-        if (status !in listOf(200, 201, 204)) raiseFromError(status, data)
-    }
-
-    suspend fun ensureStyleSubscribed(token: String, styleId: String) {
-        val usable = stylesListUsable(token)
-        if (usable.any { it.optString("id") == styleId }) return
+    fun ensureStyleSubscribed(token: String, styleId: String) {
+        if (stylesListUsable(token).any { it.optString("id") == styleId }) return
         stylesSubscribe(token, styleId)
-        val again = stylesListUsable(token)
-        if (again.none { it.optString("id") == styleId }) {
-            BridgeLog.w("文风 $styleId 订阅后仍不在 list-usable 中")
-        }
     }
 
     // ---------- Agents 消息 ----------
 
-    suspend fun agentsSend(
+    /**
+     * 发送一轮消息并同步等待 AI 回复。clientRequestId 由调用方生成：
+     * 同一 id 重试时服务端幂等返回已有回复，也可凭它调用 abort 中止。
+     */
+    fun agentsSend(
         token: String,
         sessionId: String,
         text: String,
         fileId: String?,
+        clientRequestId: String,
     ): AgentSendResult {
         val payload = JSONObject()
             .put("sessionId", sessionId)
-            .put("text", text ?: "")
-            .put("clientRequestId", UUID.randomUUID().toString())
+            .put("text", text)
+            .put("clientRequestId", clientRequestId)
         if (fileId != null) payload.put("fileId", fileId)
         val (status, data) = post(
-            "agents/messages/send",
-            payload,
-            cfg.misskey.timeoutSend,
-            token = token,
+            "agents/messages/send", payload, cfg.misskey.timeoutSend, token = token,
             extraHeaders = mapOf("Referer" to "$base/chat/agent/$sessionId"),
         )
         if (status in listOf(200, 201) && data is JSONObject) {
-            val audit = if (data.has("auditCategory") && !data.isNull("auditCategory")) data.get("auditCategory") else null
-            val auditReason = if (data.has("auditReason") && !data.isNull("auditReason")) data.get("auditReason") else null
-            if (audit != null || auditReason != null) {
+            if (data.optBoolean("aborted")) {
+                return AgentSendResult(ok = false, replyText = null, replyMessageId = null, error = "本次回复已中止。", silent = true)
+            }
+            if (data.optBoolean("auditBlocked")) {
+                val reason = data.optString("auditReason").takeIf { !data.isNull("auditReason") && it.isNotBlank() }
                 return AgentSendResult(
-                    ok = false, delivered = false, replyText = null, replyMessageId = null,
-                    error = "内容被审核拦截($audit)：${auditReason ?: ""}",
+                    ok = false, replyText = null, replyMessageId = null,
+                    error = "回复未通过内容审核，已被拦截" + (if (reason != null) "：$reason" else "。") + "可以换个说法重试。",
                 )
             }
+            val text = data.optString("assistantText")
+            val mid = if (data.isNull("assistantMessageId")) "" else data.optString("assistantMessageId")
+            val actions = data.optJSONArray("proactiveScheduleActionTypes")
+                ?.let { arr -> (0 until arr.length()).map { arr.optString(it) } } ?: emptyList()
             return AgentSendResult(
-                ok = true, delivered = true,
-                replyText = data.optString("assistantText").ifBlank { null },
-                replyMessageId = data.optString("assistantMessageId").ifBlank { null },
-                error = null,
+                ok = true,
+                replyText = text.ifBlank { null },
+                replyMessageId = mid.ifBlank { null },
+                silent = text.isBlank(),
+                scheduleActions = actions,
             )
         }
-        if (status == 204) {
-            return AgentSendResult(ok = true, delivered = true, replyText = null, replyMessageId = null, error = null)
+        if (status == 204) return AgentSendResult(ok = true, replyText = null, replyMessageId = null, silent = true)
+        // 网关超时：服务端多半仍在生成，回复会经流式 newAgentMessage 推送过来
+        if (status in listOf(502, 503, 504)) {
+            BridgeLog.i("send 返回 $status，等待流式推送回复")
+            return AgentSendResult(ok = true, replyText = null, replyMessageId = null)
         }
-        if (status == 403) {
-            val err = (data as? JSONObject)?.optJSONObject("error") ?: JSONObject()
-            throw BannedError(err.optString("code", "FORBIDDEN"))
-        }
-        if (status == 504) {
-            BridgeLog.i("504 网关超时，视为已送达")
-            return AgentSendResult(ok = true, delivered = true, replyText = null, replyMessageId = null, error = null)
-        }
-        if (status in listOf(502, 503)) {
-            if (verifyDelivered(token, sessionId, text)) {
-                return AgentSendResult(ok = true, delivered = true, replyText = null, replyMessageId = null, error = null)
-            }
-            return AgentSendResult(
-                ok = false, delivered = false, replyText = null, replyMessageId = null,
-                error = "网关错误且未能确认送达",
-            )
-        }
-        if (status == 429) throw RateLimitError(cfg.misskey.rateLimitLock)
         raiseFromError(status, data)
-        return AgentSendResult(ok = false, delivered = false, replyText = null, replyMessageId = null, error = "未知错误")
     }
 
-    /** 502/503 时无法确定是否送达，回查时间线确认，避免重复发送。 */
-    private suspend fun verifyDelivered(
-        token: String,
-        sessionId: String,
-        text: String,
-        tries: Int = 4,
-        interval: Double = 4.0,
-    ): Boolean {
-        repeat(tries) {
-            delay((interval * 1000).toLong())
-            try {
-                val msgs = agentsTimeline(token, sessionId, limit = 5)
-                for (m in msgs) {
-                    if (m.optString("role") != "user") continue
-                    val content = m.optString("content").trim()
-                    if (text.isNotBlank() && content == text.trim()) return true
-                    if (text.isBlank() && m.has("file") && !m.isNull("file")) return true
-                }
-            } catch (_: Exception) {
-            }
-        }
-        return false
+    fun agentsAbort(token: String, sessionId: String, clientRequestId: String): Boolean {
+        val data = callObject(
+            "agents/messages/abort", token,
+            JSONObject().put("sessionId", sessionId).put("clientRequestId", clientRequestId),
+        )
+        return data.optBoolean("aborted")
     }
 
-    suspend fun agentsTimeline(
+    /** 回滚到指定用户消息（含该条及之后的全部消息），返回被删条数与该用户消息原文。 */
+    fun agentsRollback(token: String, sessionId: String, userMessageId: String): JSONObject =
+        callObject(
+            "agents/messages/rollback", token,
+            JSONObject().put("sessionId", sessionId).put("messageId", userMessageId),
+        )
+
+    fun agentsMessageShow(token: String, sessionId: String, messageId: String): JSONObject =
+        callObject(
+            "agents/messages/show", token,
+            JSONObject().put("sessionId", sessionId).put("messageId", messageId),
+        )
+
+    /** 时间线，按 id 倒序（最新在前），已排除内部消息。 */
+    fun agentsTimeline(
         token: String,
         sessionId: String,
         limit: Int = 30,
         sinceId: String? = null,
         untilId: String? = null,
     ): List<JSONObject> {
-        val payload = JSONObject().put("sessionId", sessionId).put("limit", limit)
+        val payload = JSONObject().put("sessionId", sessionId).put("limit", limit.coerceIn(1, 100))
         if (sinceId != null) payload.put("sinceId", sinceId)
         if (untilId != null) payload.put("untilId", untilId)
-        val (status, data) = post("agents/messages/timeline", payload, cfg.misskey.timeoutNormal, token = token)
-        if (status != 200 || data !is JSONArray) raiseFromError(status, data)
-        return jsonArrayToList(data)
+        return callList("agents/messages/timeline", token, payload)
     }
 
     // ---------- 查询类 ----------
 
-    suspend fun creditBalance(token: String): Double? {
-        val (status, data) = post("agents/credit-balance", JSONObject(), cfg.misskey.timeoutNormal, token = token)
-        if (status != 200) raiseFromError(status, data)
-        val o = data as? JSONObject ?: return null
+    fun creditBalance(token: String): Double? {
+        val o = callObject("agents/credit-balance", token)
         return if (o.has("creditBalance") && !o.isNull("creditBalance")) o.getDouble("creditBalance") else null
     }
 
-    suspend fun meta(): JSONObject {
+    fun checkin(token: String): JSONObject = callObject("agents/checkin", token)
+
+    fun checkinStatus(token: String): JSONObject = callObject("agents/checkin-status", token)
+
+    fun meta(): JSONObject {
         val (status, data) = post("meta", JSONObject().put("detail", false), cfg.misskey.timeoutNormal)
-        if (status != 200) raiseFromError(status, data)
+        requireOk(status, data)
         return data as? JSONObject ?: JSONObject()
     }
 
-    suspend fun imageModelsList(token: String): List<JSONObject> {
-        val (status, data) = post("agents/images/models/list", JSONObject(), cfg.misskey.timeoutNormal, token = token)
-        if (status != 200 || data !is JSONArray) raiseFromError(status, data)
-        return jsonArrayToList(data)
-    }
+    fun imageModelsList(token: String): List<JSONObject> = callList("agents/images/models/list", token)
 
-    suspend fun generatePlaceholder(
-        token: String,
-        sessionId: String,
-        messageId: String,
-        index: Int,
-    ): String? {
-        val (status, data) = post(
-            "agents/images/generate-placeholder",
-            JSONObject()
-                .put("sessionId", sessionId)
-                .put("messageId", messageId)
-                .put("placeholderIndex", index)
-                .put("regenerate", false)
-                .put("regenerationOfId", JSONObject.NULL),
-            cfg.misskey.timeoutPlaceholder,
-            token = token,
-        )
+    /** 生成（或取回已生成的）画图占位符对应的图片，失败返回 null 并附原因。 */
+    fun generatePlaceholder(token: String, sessionId: String, messageId: String, index: Int): Pair<String?, String?> {
+        val (status, data) = try {
+            post(
+                "agents/images/generate-placeholder",
+                JSONObject()
+                    .put("sessionId", sessionId)
+                    .put("messageId", messageId)
+                    .put("placeholderIndex", index),
+                cfg.misskey.timeoutPlaceholder,
+                token = token,
+            )
+        } catch (e: TimeoutException) {
+            return null to "生成超时"
+        }
         if (status != 200 || data !is JSONObject) {
-            val err: Any? = data?.let {
-                val o = it as? JSONObject
-                o?.opt("errorMessage") ?: o?.opt("errorCode") ?: o?.opt("error")
-            } ?: "HTTP $status"
-            val errText = when (err) {
-                is JSONObject -> err.optString("code").ifBlank { err.optString("message") }.ifBlank { err.toString() }
-                else -> err?.toString()
-            }
-            BridgeLog.w("占位图生成失败 (index=$index): ${errText ?: data}")
-            return null
+            val code = (data as? JSONObject)?.optJSONObject("error")?.optString("code") ?: ""
+            return null to friendlyError(code, status)
         }
-        var url = data.optString("url").ifBlank { data.optString("thumbnailUrl") }
-        if (url.isBlank() && data.optJSONObject("file") != null) {
-            val file = data.optJSONObject("file") ?: JSONObject()
-            url = file.optString("url").ifBlank { file.optString("thumbnailUrl") }
+        val url = data.optString("url").takeIf { !data.isNull("url") && it.isNotBlank() }
+            ?: data.optJSONObject("file")?.optString("url")?.ifBlank { null }
+        if (url != null) return url to null
+        val reason = when (data.optString("status")) {
+            "blocked" -> "图片已被屏蔽"
+            "auto_cleaned" -> "图片已过期清理"
+            else -> data.optString("errorCode").takeIf { !data.isNull("errorCode") && it.isNotBlank() }
+                ?.let { friendlyError(it, 200) } ?: "生成失败"
         }
-        return url.ifBlank { null }
+        return null to reason
     }
 
-    suspend fun proactiveList(token: String, sessionId: String): List<JSONObject> {
-        val (status, data) = post(
-            "agents/proactive-schedules/list",
-            JSONObject().put("sessionId", sessionId),
-            cfg.misskey.timeoutNormal,
-            token = token,
-        )
-        if (status != 200 || data !is JSONArray) raiseFromError(status, data)
-        return jsonArrayToList(data)
-    }
+    fun proactiveList(token: String, sessionId: String): List<JSONObject> =
+        callList("agents/proactive-schedules/list", token, JSONObject().put("sessionId", sessionId))
 
-    suspend fun proactiveSetStatus(token: String, sessionId: String, scheduleId: String, active: Boolean) {
-        val (status, data) = post(
-            "agents/proactive-schedules/set-status",
+    fun proactiveSetStatus(token: String, sessionId: String, scheduleId: String, active: Boolean) {
+        call(
+            "agents/proactive-schedules/set-status", token,
             JSONObject()
                 .put("sessionId", sessionId)
                 .put("scheduleId", scheduleId)
                 .put("status", if (active) "active" else "paused"),
-            cfg.misskey.timeoutNormal,
-            token = token,
         )
-        if (status !in listOf(200, 201, 204)) raiseFromError(status, data)
     }
 
-    suspend fun proactiveDelete(token: String, sessionId: String, scheduleId: String) {
-        val (status, data) = post(
-            "agents/proactive-schedules/delete",
+    fun proactiveDelete(token: String, sessionId: String, scheduleId: String) {
+        call(
+            "agents/proactive-schedules/delete", token,
             JSONObject().put("sessionId", sessionId).put("scheduleId", scheduleId),
-            cfg.misskey.timeoutNormal,
-            token = token,
         )
-        if (status !in listOf(200, 201, 204)) raiseFromError(status, data)
+    }
+
+    // ---------- 长期记忆 ----------
+
+    fun memoryList(token: String, sessionId: String, pageSize: Int = 20): JSONObject =
+        callObject(
+            "agents/memory/list", token,
+            JSONObject().put("sessionId", sessionId).put("pageSize", pageSize.coerceIn(1, 50)),
+        )
+
+    fun memoryAdd(token: String, sessionId: String, content: String) {
+        call("agents/memory/add", token, JSONObject().put("sessionId", sessionId).put("content", content))
+    }
+
+    fun memoryDelete(token: String, sessionId: String, nodeId: String) {
+        call("agents/memory/delete", token, JSONObject().put("sessionId", sessionId).put("memoryNodeId", nodeId))
     }
 
     // ---------- 自定义表情 ----------
 
-    private suspend fun loadEmojiCatalog() {
+    private fun loadEmojiCatalog() {
         if (emojiListLoaded) return
         try {
             val (status, data) = post("emojis", JSONObject(), 20.0)
-            val items: JSONArray = when {
-                data is JSONObject -> data.optJSONArray("emojis") ?: JSONArray()
-                data is JSONArray -> data
-                else -> JSONArray()
-            }
+            if (status != 200) return
+            val items = (data as? JSONObject)?.optJSONArray("emojis") ?: (data as? JSONArray) ?: return
             for (i in 0 until items.length()) {
                 val item = items.optJSONObject(i) ?: continue
                 val name = item.optString("name").trim()
-                if (name.isBlank()) continue
                 val url = item.optString("url").ifBlank { item.optString("publicUrl") }
-                    .ifBlank { item.optString("originalUrl") }
-                if (url.isNotBlank()) emojiCache.putIfAbsent(name, url)
+                if (name.isNotBlank() && url.isNotBlank()) emojiCache.putIfAbsent(name, url)
             }
             emojiListLoaded = true
         } catch (e: Exception) {
@@ -528,36 +520,20 @@ class MisskeyClient(private val cfg: BridgeConfig) {
         }
     }
 
-    suspend fun emojiUrl(name: String): String? {
+    /** 实例自定义表情的图片地址；实例没有该表情时返回 null（调用方保留原文）。 */
+    fun emojiUrl(name: String): String? {
         val n = name.trim().trim(':')
         if (n.isBlank() || n.length > 100) return null
-        if (emojiCache.containsKey(n)) return emojiCache[n]
-
-        var url: String? = null
-        try {
-            val (status, data) = post("emoji", JSONObject().put("name", n), 15.0)
-            if (status == 200 && data is JSONObject) {
-                url = data.optString("url").ifBlank { data.optString("publicUrl") }
-                    .ifBlank { data.optString("originalUrl") }.ifBlank { null }
-            }
-        } catch (e: Exception) {
-            BridgeLog.d("查询表情 $n 失败: $e")
-        }
-
-        if (url == null) {
-            loadEmojiCatalog()
-            if (emojiCache.containsKey(n)) return emojiCache[n]
-        }
-
-        if (url == null) {
-            // 实例未收录时按 Misskey 的 URL 规则猜一个，多数实例可用
-            url = "$base/emoji/$n.webp"
-        }
-        emojiCache[n] = url
-        return url
+        emojiCache[n]?.let { return it }
+        if (n in missingEmoji) return null
+        loadEmojiCatalog()
+        emojiCache[n]?.let { return it }
+        if (!emojiListLoaded) return null
+        missingEmoji.add(n)
+        return null
     }
 
-    suspend fun download(url: String, timeout: Double = 60.0): Pair<ByteArray, String> {
+    fun download(url: String, timeout: Double = 60.0): Pair<ByteArray, String> {
         val req = Request.Builder().url(url).get().build()
         val call = client.newBuilder()
             .callTimeout((timeout * 1000).toLong(), TimeUnit.MILLISECONDS)
@@ -565,10 +541,9 @@ class MisskeyClient(private val cfg: BridgeConfig) {
             .newCall(req)
         call.execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("下载失败 HTTP ${resp.code}")
-            var ctype = resp.header("Content-Type", "image/jpeg") ?: "image/jpeg"
-            if (ctype.contains(";")) ctype = ctype.split(";", limit = 2)[0].trim()
+            val ctype = (resp.header("Content-Type") ?: "image/jpeg").substringBefore(";").trim()
             val bytes = resp.body?.bytes() ?: ByteArray(0)
-            return bytes to (ctype.ifBlank { "image/jpeg" })
+            return bytes to ctype.ifBlank { "image/jpeg" }
         }
     }
 
@@ -583,14 +558,15 @@ typealias StreamEvent = suspend (String, String, JSONObject) -> Unit
 /**
  * 单个绑定通道的 Misskey /streaming 监听。
  * 收到的帧先进内部队列，由独立协程串行消费，避免在 WebSocket 读线程上
- * 执行耗时业务导致心跳超时；断线后按 reconnectInterval 自动重连。
+ * 执行耗时业务导致心跳超时；断线后指数退避重连（2s 起，最长 2 分钟）。
+ * 握手被 401/403 拒绝说明 token 失效，回调 onAuthFailed 后停止重连。
  */
 class MisskeyStream(
     private val cfg: BridgeConfig,
     private val token: String,
     private val chan: String,
     private val onEvent: StreamEvent,
-    private val reconnectInterval: Double = 2.0,
+    private val onAuthFailed: suspend (String) -> Unit = {},
 ) {
     private val client = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
@@ -598,8 +574,15 @@ class MisskeyStream(
         .build()
     private val events = Channel<String>(Channel.UNLIMITED)
     private var webSocket: WebSocket? = null
+
     @Volatile
     private var stopped = false
+
+    @Volatile
+    private var authRejected = false
+
+    @Volatile
+    private var opened = false
     private var job: Job? = null
     private var consumer: Job? = null
     private val closedSignal = Semaphore(0)
@@ -628,21 +611,19 @@ class MisskeyStream(
         BridgeLog.i("Misskey 流式监听已退出 (通道 $chan)")
     }
 
-    private fun streamUrl(): String {
-        var url = cfg.misskeyStreamUrl(token)
-        if (url.startsWith("https://")) url = "wss://" + url.removePrefix("https://")
-        else if (url.startsWith("http://")) url = "ws://" + url.removePrefix("http://")
-        return url
-    }
-
     private suspend fun runLoop() {
-        val url = streamUrl()
+        val url = cfg.misskeyStreamUrl(token)
+            .replaceFirst("https://", "wss://")
+            .replaceFirst("http://", "ws://")
+        var backoffMs = INITIAL_BACKOFF_MS
         while (!stopped) {
             closedSignal.drainPermits()
+            opened = false
+            val attemptStart = System.currentTimeMillis()
             try {
-                val request = Request.Builder().url(url).build()
                 val listener = object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
+                        opened = true
                         webSocket.send(
                             JSONObject()
                                 .put("type", "connect")
@@ -653,14 +634,22 @@ class MisskeyStream(
                     }
 
                     override fun onMessage(webSocket: WebSocket, text: String) {
-                        if (stopped) return
-                        events.trySend(text)
+                        if (!stopped) events.trySend(text)
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                        if (!stopped) {
-                            BridgeLog.w("Misskey 流式异常 (通道 $chan): $t，${reconnectInterval}s 后重连")
+                        val code = response?.code ?: 0
+                        if (code == 401 || code == 403) authRejected = true
+                        if (!stopped && !authRejected) {
+                            BridgeLog.w("Misskey 流式断开 (通道 $chan): ${t.message ?: t}")
                         }
+                        closedSignal.release()
+                    }
+
+                    // 服务端发来关闭帧时 OkHttp 只回调 onClosing，必须回应并放行，
+                    // 否则等待循环永远不会结束，断线后不再重连
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
                         closedSignal.release()
                     }
 
@@ -668,7 +657,7 @@ class MisskeyStream(
                         closedSignal.release()
                     }
                 }
-                val ws = client.newWebSocket(request, listener)
+                val ws = client.newWebSocket(Request.Builder().url(url).build(), listener)
                 webSocket = ws
                 while (!stopped && !closedSignal.tryAcquire(200, TimeUnit.MILLISECONDS)) {
                     if (job?.isCancelled == true) break
@@ -680,13 +669,19 @@ class MisskeyStream(
             } catch (e: CancellationException) {
                 break
             } catch (e: Exception) {
-                if (!stopped) {
-                    BridgeLog.w("Misskey 流式异常 (通道 $chan): $e，${reconnectInterval}s 后重连")
-                }
+                if (!stopped) BridgeLog.w("Misskey 流式异常 (通道 $chan): $e")
             }
-            if (!stopped) {
-                delay((reconnectInterval * 1000).toLong())
+            if (stopped) break
+            if (authRejected) {
+                BridgeLog.w("Misskey 流式握手被拒绝，token 可能已失效 (通道 $chan)")
+                onAuthFailed(chan)
+                break
             }
+            // 连接稳定存活一段时间才算健康并重置退避；刚连上就被踢的不算，
+            // 否则服务端异常时会一直以最短间隔重连
+            if (opened && System.currentTimeMillis() - attemptStart >= HEALTHY_MS) backoffMs = INITIAL_BACKOFF_MS
+            delay(backoffMs)
+            backoffMs = (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
         }
     }
 
@@ -698,20 +693,23 @@ class MisskeyStream(
         }
         if (data.optString("type") != "channel") return
         val body = data.optJSONObject("body") ?: return
-        val btype = body.optString("type")
         val payload = body.optJSONObject("body") ?: JSONObject()
-        when (btype) {
-            "newAgentMessage" -> safeCb("agent_message", payload)
-            "newChatMessage" -> safeCb("chat", payload)
-            "notification" -> safeCb("notification", payload)
+        val etype = when (body.optString("type")) {
+            "newAgentMessage" -> "agent_message"
+            "newChatMessage" -> "chat"
+            "notification" -> "notification"
+            else -> return
         }
-    }
-
-    private suspend fun safeCb(etype: String, payload: JSONObject) {
         try {
             onEvent(chan, etype, payload)
         } catch (e: Exception) {
             BridgeLog.e("处理 Misskey 流式事件失败 (通道 $chan, $etype)", e)
         }
+    }
+
+    private companion object {
+        const val INITIAL_BACKOFF_MS = 2_000L
+        const val MAX_BACKOFF_MS = 120_000L
+        const val HEALTHY_MS = 30_000L
     }
 }

@@ -16,8 +16,10 @@ import com.aliya2qq.bridge.misskey.MisskeyClient
 import com.aliya2qq.bridge.platforms.createPlatform
 import com.aliya2qq.bridge.ui.MainActivity
 import com.aliya2qq.bridge.util.BridgeLog
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -30,7 +32,23 @@ class BridgeService : Service() {
     companion object {
         @Volatile
         var isRunning = false
-            private set
+            private set(value) {
+                field = value
+                onStateChanged?.invoke()
+            }
+
+        /** 运行状态或平台连接状态变化时回调（任意线程）。 */
+        @Volatile
+        var onStateChanged: (() -> Unit)? = null
+
+        /** 当前 QQ 连接描述，UI 显示用；未运行时为 null。 */
+        @Volatile
+        var connectionLabel: String? = null
+            private set(value) {
+                if (field == value) return
+                field = value
+                onStateChanged?.invoke()
+            }
 
         @Volatile
         var instance: BridgeService? = null
@@ -71,6 +89,7 @@ class BridgeService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        connectionLabel = null
         instance = null
         serviceScope.launch {
             try {
@@ -108,6 +127,10 @@ class BridgeService : Service() {
             try {
                 val cfgPath = configFile(this@BridgeService)
                 val cfg = ConfigLoader.load(cfgPath, defaultDataDir(this@BridgeService))
+                val missing = cfg.missingRequired()
+                if (missing.isNotEmpty()) {
+                    throw IllegalStateException("设置未填写完整：${missing.joinToString("、")}")
+                }
                 BridgeLog.setLogFile(cfg.logFile.ifBlank { null })
                 val database = Database(File(cfg.dataDir, "bridge.db").absolutePath)
                 db = database
@@ -118,10 +141,23 @@ class BridgeService : Service() {
                 platform.setMessageHandler { msg -> b.handlePlatformMessage(msg) }
                 b.start()
                 BridgeLog.i("桥接启动完成，平台 ${platform.displayName} -> Misskey ${cfg.misskey.host}")
+                // 平台连接状态没有事件可订阅，轮询刷新给 UI
+                launch {
+                    while (true) {
+                        connectionLabel = when {
+                            !platform.connected -> "等待 QQ 连接"
+                            platform.selfQq.isNullOrBlank() -> "已连接 QQ"
+                            else -> "QQ ${platform.selfQq}"
+                        }
+                        delay(2000)
+                    }
+                }
                 // 主循环：平台 run_forever（断线重连）
                 platform.runForever()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                BridgeLog.e("桥接运行失败", e)
+                BridgeLog.e("桥接启动失败：${e.message ?: e}")
                 isRunning = false
                 stopSelf()
             }
